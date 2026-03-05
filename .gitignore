@@ -1,0 +1,33 @@
+.claude/
+.cursor/
+data/carOBD/
+results-new/
+results-new-split/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model checkpoints & outputs
+checkpoints/
+*.pt
+*.pth
+
+# Generated data
+llm/evaluation/shared_dataset/
+demo/demo_cache.pkl
+
+# OS
+.DS_Store
