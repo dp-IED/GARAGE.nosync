@@ -1,8 +1,5 @@
 .claude/
 .cursor/
-data/carOBD/
-results-new/
-results-new-split/
 
 # Python
 __pycache__/
