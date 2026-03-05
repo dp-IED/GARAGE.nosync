@@ -1,0 +1,4 @@
+Method,Window F1,Window Prec,Window Rec,Sensor F1,Sensor Prec,Sensor Rec,Fault Type Acc,BERTScore F1
+GDN Only,1.000,1.000,1.000,1.000,1.000,1.000,0.000,N/A
+LLM Baseline,0.425,1.000,0.270,0.384,1.000,0.238,0.601,0.871
+GDN-KG-LLM,0.721,0.915,0.595,0.590,0.581,0.600,0.693,0.864

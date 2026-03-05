@@ -1,0 +1,188 @@
+{
+  "classification_metrics": {
+    "accuracy": 1.0,
+    "precision": 1.0,
+    "recall": 1.0,
+    "f1_score": 1.0,
+    "threshold": 0.04234255105257034
+  },
+  "sensor_attribution_metrics": {
+    "precision": 1.0,
+    "recall": 0.9945945945945946,
+    "f1_score": 0.997289972899729,
+    "threshold": 0.21914084255695343
+  },
+  "threshold_mode": "checkpoint",
+  "apply_global_mask": false,
+  "global_mask_threshold": 0.5,
+  "window_threshold_source": "checkpoint",
+  "sensor_threshold_source": "checkpoint",
+  "thresholds": {
+    "window": 0.04234255105257034,
+    "sensor": 0.21914084255695343
+  },
+  "threshold_sweep": [
+    {
+      "threshold": 0.3,
+      "window": {
+        "precision": 1.0,
+        "recall": 0.9939,
+        "f1": 0.9969
+      },
+      "sensor": {
+        "precision": 1.0,
+        "recall": 0.9946,
+        "f1": 0.9973
+      }
+    },
+    {
+      "threshold": 0.35,
+      "window": {
+        "precision": 1.0,
+        "recall": 0.9939,
+        "f1": 0.9969
+      },
+      "sensor": {
+        "precision": 1.0,
+        "recall": 0.9946,
+        "f1": 0.9973
+      }
+    },
+    {
+      "threshold": 0.4,
+      "window": {
+        "precision": 1.0,
+        "recall": 0.9939,
+        "f1": 0.9969
+      },
+      "sensor": {
+        "precision": 1.0,
+        "recall": 0.9946,
+        "f1": 0.9973
+      }
+    },
+    {
+      "threshold": 0.45,
+      "window": {
+        "precision": 1.0,
+        "recall": 0.9939,
+        "f1": 0.9969
+      },
+      "sensor": {
+        "precision": 1.0,
+        "recall": 0.9946,
+        "f1": 0.9973
+      }
+    },
+    {
+      "threshold": 0.5,
+      "window": {
+        "precision": 1.0,
+        "recall": 0.9939,
+        "f1": 0.9969
+      },
+      "sensor": {
+        "precision": 1.0,
+        "recall": 0.9946,
+        "f1": 0.9973
+      }
+    },
+    {
+      "threshold": 0.55,
+      "window": {
+        "precision": 1.0,
+        "recall": 0.9939,
+        "f1": 0.9969
+      },
+      "sensor": {
+        "precision": 1.0,
+        "recall": 0.9946,
+        "f1": 0.9973
+      }
+    },
+    {
+      "threshold": 0.6,
+      "window": {
+        "precision": 1.0,
+        "recall": 0.9939,
+        "f1": 0.9969
+      },
+      "sensor": {
+        "precision": 1.0,
+        "recall": 0.9946,
+        "f1": 0.9973
+      }
+    },
+    {
+      "threshold": 0.65,
+      "window": {
+        "precision": 1.0,
+        "recall": 0.9939,
+        "f1": 0.9969
+      },
+      "sensor": {
+        "precision": 1.0,
+        "recall": 0.9946,
+        "f1": 0.9973
+      }
+    },
+    {
+      "threshold": 0.7,
+      "window": {
+        "precision": 1.0,
+        "recall": 0.9939,
+        "f1": 0.9969
+      },
+      "sensor": {
+        "precision": 1.0,
+        "recall": 0.9946,
+        "f1": 0.9973
+      }
+    },
+    {
+      "threshold": 0.75,
+      "window": {
+        "precision": 1.0,
+        "recall": 0.9939,
+        "f1": 0.9969
+      },
+      "sensor": {
+        "precision": 1.0,
+        "recall": 0.9946,
+        "f1": 0.9973
+      }
+    },
+    {
+      "threshold": 0.8,
+      "window": {
+        "precision": 1.0,
+        "recall": 0.9939,
+        "f1": 0.9969
+      },
+      "sensor": {
+        "precision": 1.0,
+        "recall": 0.9946,
+        "f1": 0.9973
+      }
+    }
+  ],
+  "per_drive_f1": [
+    {
+      "drive": "drive10.csv",
+      "n": 431,
+      "n_faulty": 113,
+      "f1": 0.9955555555555555,
+      "precision": 1.0,
+      "recall": 0.9911504424778761
+    },
+    {
+      "drive": "drive6.csv",
+      "n": 159,
+      "n_faulty": 50,
+      "f1": 1.0,
+      "precision": 1.0,
+      "recall": 1.0
+    }
+  ],
+  "test_fault_rate": 0.27627118644067794
+}

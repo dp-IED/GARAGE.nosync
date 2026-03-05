@@ -1,0 +1,25 @@
+{
+  "metrics": {
+    "window": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "accuracy": 1.0
+    },
+    "sensor": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0
+    },
+    "fault_type": {
+      "accuracy": 0.0,
+      "n": 163
+    },
+    "bertscore": {
+      "precision": null,
+      "recall": null,
+      "f1": null
+    }
+  },
+  "num_windows": 590
+}
