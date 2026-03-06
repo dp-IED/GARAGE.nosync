@@ -61,9 +61,9 @@ LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4
 
 # Model architecture
-EMBED_DIM = 16
+EMBED_DIM = 32  # Doubled from 16 for more capacity
 TOP_K = 7  # Increased from 5 for better connectivity
-HIDDEN_DIM = 32
+HIDDEN_DIM = 64  # Doubled from 32 for more capacity
 
 # ============================================================================
 # Model with Forecasting Head
