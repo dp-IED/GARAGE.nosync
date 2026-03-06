@@ -249,12 +249,18 @@ def load_gdn_model(model_path: str, device: str = "cpu") -> Tuple[GDN, Dict[str,
 
     model.eval()
 
+    calibrated = checkpoint.get("calibrated_thresholds") or {}
     metadata = {
         "sensor_names": sensor_names,
         "window_size": window_size,
         "embed_dim": embed_dim,
         "top_k": top_k,
         "hidden_dim": hidden_dim,
+        "calibrated_thresholds": calibrated,
+        "sensor_threshold": float(
+            calibrated.get("sensor", checkpoint.get("sensor_threshold", 0.5))
+        ),
+        "per_sensor_thresholds": calibrated.get("per_sensor", []),
     }
 
     print(f"✓ Loaded model: {num_sensors} sensors, window_size={window_size}")
@@ -392,11 +398,18 @@ class GDNPredictor:
         top_k: int = 3,
         hidden_dim: int = 32,
         device: str = "cpu",
+        sensor_threshold: Optional[float] = None,
     ):
         self.model, self._metadata = load_gdn_model(model_path, device)
         self.sensor_names = sensor_names
         self.window_size = window_size
         self.device = device
+        self.sensor_threshold = (
+            sensor_threshold
+            if sensor_threshold is not None
+            else self._metadata.get("sensor_threshold", 0.5)
+        )
+        self.per_sensor_thresholds = self._metadata.get("per_sensor_thresholds", [])
 
     def predict(
         self,
@@ -435,6 +448,8 @@ class GDNPredictor:
             "adjacency_matrix": adjacency_matrix,
             "X_windows": X_windows,
             "gdn_predictions": gdn_predictions,
+            "propagation_threshold": self.sensor_threshold,
+            "per_sensor_thresholds": self.per_sensor_thresholds,
         }
 
 
@@ -493,7 +508,7 @@ class KnowledgeGraph:
         self,
         sensor_names: List[str],
         sensor_embeddings: np.ndarray,
-        adjacency_matrix: np.ndarray,
+        adjacency_matrix: Optional[np.ndarray] = None,
     ):
         """
         Initialize the Knowledge Graph.
@@ -501,7 +516,7 @@ class KnowledgeGraph:
         Args:
             sensor_names: List of sensor names (must match order in data)
             sensor_embeddings: Learned sensor embeddings from GDN (num_sensors, embed_dim)
-            adjacency_matrix: Adjacency matrix from GDN (num_sensors, num_sensors)
+            adjacency_matrix: Adjacency matrix from GDN (num_sensors, num_sensors), or None to skip GDN-based edge inference
         """
         self.sensor_names = sensor_names
         self.sensor_embeddings = sensor_embeddings
@@ -555,6 +570,7 @@ class KnowledgeGraph:
         X_windows_unnormalized: Optional[np.ndarray] = None,
         sensor_labels_true: Optional[np.ndarray] = None,
         window_labels_true: Optional[np.ndarray] = None,
+        propagation_threshold: Optional[float] = None,
     ) -> "KnowledgeGraph":
         """
         Main method: Build KG by traversing windows temporally.
@@ -607,8 +623,9 @@ class KnowledgeGraph:
                 window_idx, window_data, window_gdn_scores
             )
 
-        # Track anomaly propagation
-        self._track_anomaly_propagation(gdn_predictions)
+        # Track anomaly propagation (use checkpoint threshold if provided)
+        thr = propagation_threshold if propagation_threshold is not None else 0.5
+        self._track_anomaly_propagation(gdn_predictions, threshold=thr)
 
         print(
             f"✓ Knowledge Graph built: {self.number_of_nodes()} nodes, {self.number_of_edges()} edges"
@@ -687,7 +704,11 @@ class KnowledgeGraph:
                     continue
 
                 window_corr = correlation_matrix[i, j]
-                expected_corr = self.adjacency_matrix[i, j]
+                expected_corr = (
+                    self.adjacency_matrix[i, j]
+                    if self.adjacency_matrix is not None
+                    else window_corr
+                )
 
                 edge_type, edge_attrs = self._infer_semantic_edge(
                     sensor_i,
@@ -965,7 +986,11 @@ class KnowledgeGraph:
                     continue
 
                 window_corr = correlation_matrix[i, j]
-                expected_corr_gdn = self.adjacency_matrix[i, j]
+                expected_corr_gdn = (
+                    self.adjacency_matrix[i, j]
+                    if self.adjacency_matrix is not None
+                    else window_corr
+                )
                 deviation_from_gdn = abs(window_corr - expected_corr_gdn)
 
                 stats_i = window_stats.get(sensor_i)
@@ -1163,7 +1188,7 @@ class KnowledgeGraph:
             data = {
                 "sensor_names": self.sensor_names,
                 "sensor_embeddings": self.sensor_embeddings.tolist(),
-                "adjacency_matrix": self.adjacency_matrix.tolist(),
+                "adjacency_matrix": self.adjacency_matrix.tolist() if self.adjacency_matrix is not None else None,
                 "window_graphs": {
                     str(k): nx.node_link_data(v) for k, v in self.window_graphs.items()
                 },
@@ -1223,10 +1248,11 @@ class KnowledgeGraph:
                 data = json.load(f)
 
             # Reconstruct KG
+            adj = data.get("adjacency_matrix")
             kg = cls(
                 sensor_names=data["sensor_names"],
                 sensor_embeddings=np.array(data["sensor_embeddings"]),
-                adjacency_matrix=np.array(data["adjacency_matrix"]),
+                adjacency_matrix=np.array(adj) if adj is not None else None,
             )
 
             # Reconstruct window graphs
@@ -1507,6 +1533,7 @@ def main():
         X_windows=X_windows,
         gdn_predictions=gdn_predictions,
         X_windows_unnormalized=X_windows_unnormalized,
+        propagation_threshold=metadata.get("sensor_threshold"),
     )
 
     # Save to file if requested
