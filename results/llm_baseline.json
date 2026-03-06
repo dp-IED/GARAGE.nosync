@@ -1,0 +1,384 @@
+{
+  "method": "llm_baseline",
+  "dataset": "data/shared_dataset/test.npz",
+  "num_windows": 2,
+  "metrics": {
+    "window_level": {
+      "window_accuracy": 0.5,
+      "window_precision_weighted": 0.25,
+      "window_recall_weighted": 0.5,
+      "window_f1_weighted": 0.3333333333333333,
+      "window_precision_macro": 0.25,
+      "window_recall_macro": 0.5,
+      "window_f1_macro": 0.3333333333333333,
+      "window_precision": 0.25,
+      "window_recall": 0.5,
+      "window_f1": 0.3333333333333333,
+      "per_class": {
+        "no_fault": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.6666666666666666,
+          "support": 1
+        },
+        "ENGINE_RPM ()": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 0
+        },
+        "VEHICLE_SPEED ()": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 0
+        },
+        "THROTTLE ()": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 0
+        },
+        "ENGINE_LOAD ()": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 0
+        },
+        "COOLANT_TEMPERATURE ()": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 1
+        },
+        "INTAKE_MANIFOLD_PRESSURE ()": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 0
+        },
+        "SHORT_TERM_FUEL_TRIM_BANK_1 ()": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 0
+        },
+        "LONG_TERM_FUEL_TRIM_BANK_1 ()": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 0
+        }
+      }
+    },
+    "sensor_level": {
+      "sensor_accuracy": 0.9375,
+      "sensor_precision": 0.0,
+      "sensor_recall": 0.0,
+      "sensor_f1": 0.0,
+      "per_sensor": {
+        "ENGINE_RPM ()": {
+          "accuracy": 1.0,
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 0,
+          "true_negatives": 2
+        },
+        "VEHICLE_SPEED ()": {
+          "accuracy": 1.0,
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 0,
+          "true_negatives": 2
+        },
+        "THROTTLE ()": {
+          "accuracy": 1.0,
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 0,
+          "true_negatives": 2
+        },
+        "ENGINE_LOAD ()": {
+          "accuracy": 1.0,
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 0,
+          "true_negatives": 2
+        },
+        "COOLANT_TEMPERATURE ()": {
+          "accuracy": 0.5,
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 1,
+          "true_negatives": 1
+        },
+        "INTAKE_MANIFOLD_PRESSURE ()": {
+          "accuracy": 1.0,
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 0,
+          "true_negatives": 2
+        },
+        "SHORT_TERM_FUEL_TRIM_BANK_1 ()": {
+          "accuracy": 1.0,
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 0,
+          "true_negatives": 2
+        },
+        "LONG_TERM_FUEL_TRIM_BANK_1 ()": {
+          "accuracy": 1.0,
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 0,
+          "true_negatives": 2
+        }
+      }
+    },
+    "confusion_matrices": {
+      "window_confusion_matrix": [
+        [
+          1,
+          0
+        ],
+        [
+          1,
+          0
+        ]
+      ],
+      "sensor_confusion_matrix": [
+        [
+          15,
+          0
+        ],
+        [
+          1,
+          0
+        ]
+      ],
+      "per_sensor_confusion_matrices": {
+        "ENGINE_RPM ()": [
+          [
+            2
+          ]
+        ],
+        "VEHICLE_SPEED ()": [
+          [
+            2
+          ]
+        ],
+        "THROTTLE ()": [
+          [
+            2
+          ]
+        ],
+        "ENGINE_LOAD ()": [
+          [
+            2
+          ]
+        ],
+        "COOLANT_TEMPERATURE ()": [
+          [
+            1,
+            0
+          ],
+          [
+            1,
+            0
+          ]
+        ],
+        "INTAKE_MANIFOLD_PRESSURE ()": [
+          [
+            2
+          ]
+        ],
+        "SHORT_TERM_FUEL_TRIM_BANK_1 ()": [
+          [
+            2
+          ]
+        ],
+        "LONG_TERM_FUEL_TRIM_BANK_1 ()": [
+          [
+            2
+          ]
+        ]
+      }
+    },
+    "sensor_level_raw": {
+      "sensor_accuracy": 0.9375,
+      "sensor_precision": 0.0,
+      "sensor_recall": 0.0,
+      "sensor_f1": 0.0,
+      "per_sensor": {
+        "ENGINE_RPM ()": {
+          "accuracy": 1.0,
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 0,
+          "true_negatives": 2
+        },
+        "VEHICLE_SPEED ()": {
+          "accuracy": 1.0,
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 0,
+          "true_negatives": 2
+        },
+        "THROTTLE ()": {
+          "accuracy": 1.0,
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 0,
+          "true_negatives": 2
+        },
+        "ENGINE_LOAD ()": {
+          "accuracy": 1.0,
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 0,
+          "true_negatives": 2
+        },
+        "COOLANT_TEMPERATURE ()": {
+          "accuracy": 0.5,
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 1,
+          "true_negatives": 1
+        },
+        "INTAKE_MANIFOLD_PRESSURE ()": {
+          "accuracy": 1.0,
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 0,
+          "true_negatives": 2
+        },
+        "SHORT_TERM_FUEL_TRIM_BANK_1 ()": {
+          "accuracy": 1.0,
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 0,
+          "true_negatives": 2
+        },
+        "LONG_TERM_FUEL_TRIM_BANK_1 ()": {
+          "accuracy": 1.0,
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 0,
+          "true_negatives": 2
+        }
+      }
+    },
+    "efficiency": {
+      "avg_processing_time_seconds": 7.557514429092407,
+      "total_processing_time_seconds": 15.115028858184814,
+      "windows_per_second": 0.13231863589310955,
+      "avg_context_length_tokens": 72.0
+    }
+  },
+  "predictions": {
+    "window_labels": [
+      0,
+      0
+    ],
+    "sensor_labels": [
+      [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    ],
+    "sensor_labels_raw": [
+      [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    ],
+    "fault_types": [
+      "normal",
+      "normal"
+    ],
+    "reasoning": [
+      "No sensor readings exceeded the anomaly threshold of 0.30. All provided valid sensors were within normal operating ranges based on their respective data.",
+      "No sensor readings exceeded the anomaly threshold of 0.30. All provided valid sensors were within normal operating ranges based on their respective data."
+    ]
+  }
+}
