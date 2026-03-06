@@ -88,16 +88,16 @@ NUM_EPOCHS = 40
 BATCH_SIZE = 32
 LEARNING_RATE = 5e-4
 WEIGHT_DECAY = 1e-4
-EMBED_DIM = 16
+EMBED_DIM = 32  # Doubled from 16 for more capacity
 TOP_K = 7
-HIDDEN_DIM = 32
+HIDDEN_DIM = 64  # Doubled from 32 for more capacity
 
 # default objective knobs
 LAMBDA_SENSOR = 1.0
-LAMBDA_WINDOW = 0.1
+LAMBDA_WINDOW = 0.3  # Increased from 0.1 - give window classifier more gradient signal
 SENSOR_POS_WEIGHT_SCALE = 0.6
-SENSOR_POS_WEIGHT_SCALE_MIN = 0.3
-SENSOR_POS_WEIGHT_SCALE_DECAY_EPOCHS = 20
+SENSOR_POS_WEIGHT_SCALE_MIN = 0.5  # Increased from 0.3 - maintain class balancing longer
+SENSOR_POS_WEIGHT_SCALE_DECAY_EPOCHS = 50  # Increased from 20 - slower decay for better late-stage training
 SENSOR_POS_WEIGHT_CAP = 12.0
 WINDOW_SCORE_WEIGHT = 0.25  # Lower so global branch can win and receive gradients (was 0.5, win_branch_global_pct was 0%)
 
@@ -498,6 +498,9 @@ def train_stage2_clean(
     missing, unexpected = model.load_state_dict(base_state_dict, strict=False)
     unexpected_filtered = [k for k in unexpected if "global_classifier" not in k]
     missing_filtered = [k for k in missing if "global_classifier" not in k]
+    # Allow new parameters (sensor_output_bias, window_temp) to be missing from old checkpoints
+    new_params = ["sensor_output_bias", "window_temp"]
+    missing_filtered = [k for k in missing_filtered if k not in new_params]
     if missing_filtered:
         raise ValueError(f"Unexpected missing keys in checkpoint: {missing_filtered}")
     if unexpected_filtered:
@@ -897,7 +900,7 @@ def train_stage2_clean(
                 sensor_probs = torch.sigmoid(sensor_logits)
                 all_sensor_probs.append(sensor_probs)
                 # EXPERIMENT: global-only window scores (KIT diagnostic)
-                window_score_inference = torch.sigmoid(global_logits.squeeze(-1))
+                window_score_inference = torch.sigmoid(global_logits.squeeze(-1)).reshape(-1)
                 all_window_scores.append(window_score_inference)
 
         val_loss_sensor /= len(val_loader.dataset)
@@ -949,7 +952,7 @@ def train_stage2_clean(
                     calib_sensor_probs_list.append(torch.sigmoid(sensor_logits))
                     calib_window_labels_list.append(window_labels_batch)
                     # EXPERIMENT: global-only window scores (KIT diagnostic)
-                    window_score_inference = torch.sigmoid(global_logits.squeeze(-1))
+                    window_score_inference = torch.sigmoid(global_logits.squeeze(-1)).reshape(-1)
                     calib_window_scores_list.append(window_score_inference)
             calib_sensor_labels = torch.cat(calib_sensor_labels_list, dim=0)
             calib_sensor_probs = torch.cat(calib_sensor_probs_list, dim=0)
@@ -1158,6 +1161,9 @@ def train_stage2_clean(
     missing, unexpected = model.load_state_dict(model_state, strict=False)
     unexpected_filtered = [k for k in unexpected if "global_classifier" not in k]
     missing_filtered = [k for k in missing if "global_classifier" not in k]
+    # Allow new parameters (sensor_output_bias, window_temp) to be missing from old checkpoints
+    new_params = ["sensor_output_bias", "window_temp"]
+    missing_filtered = [k for k in missing_filtered if k not in new_params]
     if missing_filtered:
         raise ValueError(f"Unexpected missing keys in checkpoint: {missing_filtered}")
     if unexpected_filtered:
@@ -1421,6 +1427,12 @@ def main():
     parser.add_argument(
         "--seed", type=int, default=42, help="Random seed for reproducibility"
     )
+    parser.add_argument(
+        "--calib_split_ratio",
+        type=float,
+        default=0.125,
+        help="Ratio of training data to split off for calibration set (default: 0.125 = ~12.5%%)",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -1459,28 +1471,48 @@ def main():
     train_data = np.load(train_npz, allow_pickle=True)
     val_data = np.load(val_npz, allow_pickle=True)
 
-    X_train_sensor = torch.tensor(train_data["normalized_windows"], dtype=torch.float32)
-    train_sensor_labels = torch.tensor(train_data["sensor_labels"], dtype=torch.float32)
-    train_window_labels = torch.tensor(train_data["window_is_faulty"], dtype=torch.long)
+    # Load full training data first
+    X_full_train = torch.tensor(train_data["normalized_windows"], dtype=torch.float32)
+    full_sensor_labels = torch.tensor(train_data["sensor_labels"], dtype=torch.float32)
+    full_window_labels = torch.tensor(train_data["window_is_faulty"], dtype=torch.long)
 
+    # Split training data into train/calib (held-out calibration set)
+    # Use stratified split to maintain fault distribution
+    calib_split_ratio = args.calib_split_ratio if args.calib_split_ratio > 0 else 0.125
+    num_train_samples = len(X_full_train)
+    num_calib_samples = int(num_train_samples * calib_split_ratio)
+
+    # Create indices and shuffle
+    indices = torch.randperm(num_train_samples, generator=torch.Generator().manual_seed(args.seed))
+
+    calib_indices = indices[:num_calib_samples]
+    train_indices = indices[num_calib_samples:]
+
+    # Split the data
+    X_train_sensor = X_full_train[train_indices]
+    train_sensor_labels = full_sensor_labels[train_indices]
+    train_window_labels = full_window_labels[train_indices]
+
+    X_calib_sensor = X_full_train[calib_indices]
+    calib_sensor_labels = full_sensor_labels[calib_indices]
+    calib_window_labels = full_window_labels[calib_indices]
+
+    # Load validation data (kept separate)
     X_val_sensor = torch.tensor(val_data["normalized_windows"], dtype=torch.float32)
     val_sensor_labels = torch.tensor(val_data["sensor_labels"], dtype=torch.float32)
     val_window_labels = torch.tensor(val_data["window_is_faulty"], dtype=torch.long)
 
     # Stage 2 loss does not use y_* directly; last timestep keeps TensorDataset shape consistent
     y_train = X_train_sensor[:, -1, :]
+    y_calib = X_calib_sensor[:, -1, :]
     y_val = X_val_sensor[:, -1, :]
-
-    # Val doubles as calibration set
-    X_calib_sensor = X_val_sensor
-    calib_sensor_labels = val_sensor_labels
-    calib_window_labels = val_window_labels
-    y_calib = y_val
 
     train_faulty = train_window_labels.sum().item()
     val_faulty = val_window_labels.sum().item()
-    print(f"  Train: {train_faulty}/{len(X_train_sensor)} faulty windows")
-    print(f"  Val:   {val_faulty}/{len(X_val_sensor)} faulty windows")
+    calib_faulty = calib_window_labels.sum().item()
+    print(f"  Train: {train_faulty}/{len(X_train_sensor)} faulty windows ({len(X_train_sensor)} samples)")
+    print(f"  Calib: {calib_faulty}/{len(X_calib_sensor)} faulty windows ({len(X_calib_sensor)} samples)")
+    print(f"  Val:   {val_faulty}/{len(X_val_sensor)} faulty windows ({len(X_val_sensor)} samples)")
 
     train_ds = TensorDataset(
         X_train_sensor, y_train, train_sensor_labels, train_window_labels
