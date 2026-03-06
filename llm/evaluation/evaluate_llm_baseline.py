@@ -18,29 +18,20 @@ from typing import Dict, List, Optional
 import time
 import sys
 from tqdm import tqdm
-from openai import OpenAI
 
 # Add paths for imports
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
+from llm.inference import (
+    create_client,
+    create_json_schema_response_format,
+    LMStudioClient,
+)
+
 from llm.evaluation.metrics import compute_all_metrics, format_metrics_report
 from llm.evaluation.schemas import FaultDiagnosis
 from llm.evaluation.utils import parse_structured_response, parsed_to_prediction
-
-@dataclass
-class LMStudioConfig:
-    """Minimal config for LM Studio HTTP API (model_name, base_url)."""
-    model_name: str
-    base_url: str
-
-
-def load_lm_studio_model(
-    model_name: str = "granite-4.0-h-micro-GGUF",
-    base_url: str = "http://localhost:1234/v1",
-) -> LMStudioConfig:
-    """Return config for LM Studio HTTP API."""
-    return LMStudioConfig(model_name=model_name, base_url=base_url)
 
 
 SYSTEM_PROMPT = (
@@ -82,25 +73,25 @@ def build_baseline_prompt(
 
 
 def _call_llm_structured(
-    client: OpenAI,
+    client: LMStudioClient,
     model_name: str,
     messages: List[Dict[str, str]],
 ) -> str:
-    response = client.chat.completions.create(
+    """Call LLM with structured JSON schema output."""
+    response_format = create_json_schema_response_format(
+        schema_name="FaultDiagnosis",
+        schema_dict=FaultDiagnosis.model_json_schema(),
+        strict=True
+    )
+
+    response = client.chat_completions_create(
         model=model_name,
         messages=messages,
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "FaultDiagnosis",
-                "strict": True,
-                "schema": FaultDiagnosis.model_json_schema(),
-            },
-        },
+        response_format=response_format,
         temperature=0.0,
         max_tokens=256,
     )
-    return response.choices[0].message.content
+    return response["choices"][0]["message"]["content"]
 
 
 def filter_sensor_labels_to_root_only(parsed_result: Dict, sensor_names: List[str]) -> np.ndarray:
@@ -143,7 +134,7 @@ def filter_sensor_labels_to_root_only(parsed_result: Dict, sensor_names: List[st
 def load_llm_model(
     model_repo: str = "granite-4.0-h-micro-GGUF",
     base_url: str = "http://localhost:1234/v1",
-):
+) -> LMStudioClient:
     """
     Load LLM model via LM Studio HTTP server.
 
@@ -152,31 +143,21 @@ def load_llm_model(
         base_url: Base URL for LM Studio HTTP server
 
     Returns:
-        Tuple of (model, tokenizer) where both are the same LMStudioConfig instance
-        for backward compatibility with code expecting (model, tokenizer) tuple
+        LMStudioClient instance
     """
-    # Convert old MLX model repo format to LM Studio model name if needed
-    if model_repo.startswith("mlx-community/"):
-        # Extract model name from MLX format
-        model_name = model_repo.replace("mlx-community/", "").replace("-8bit", "").replace("-4bit", "")
-        model_name = f"{model_name}-GGUF"
-    else:
-        model_name = model_repo
-
-    print(f"Connecting to LM Studio for model: {model_name}")
-    inference = load_lm_studio_model(model_name=model_name, base_url=base_url)
-    
-    # Return as tuple for backward compatibility
-    # Both model and tokenizer are the same LMStudioConfig instance
-    return inference, inference
+    print(f"Connecting to LM Studio for model: {model_repo}")
+    client = create_client(
+        model_name=model_repo,
+        base_url=base_url,
+        check_connection=True
+    )
+    return client
 
 
 def evaluate_llm_baseline(
     dataset_path: Path,
     output_path: Optional[Path] = None,
-    use_statistical_features: bool = True,
     model_repo: Optional[str] = None,
-    model_path: Optional[Path] = None,
     base_url: Optional[str] = None,
     limit: Optional[int] = None,
 ) -> Dict[str, any]:
@@ -186,9 +167,7 @@ def evaluate_llm_baseline(
     Args:
         dataset_path: Path to shared dataset (.npz file)
         output_path: Optional path to save results JSON
-        use_statistical_features: Unused (kept for API compatibility)
         model_repo: Model name in LM Studio
-        model_path: Optional GDN checkpoint path for sensor_scores (fair comparison with KAG)
         limit: Optional limit on number of windows to process (for testing)
 
     Returns:
@@ -198,7 +177,6 @@ def evaluate_llm_baseline(
     print("Evaluating LLM Baseline")
     print("=" * 80)
     print(f"Dataset: {dataset_path}")
-    print(f"Use statistical features: {use_statistical_features}")
     print()
 
     # Load LLM model
@@ -207,7 +185,7 @@ def evaluate_llm_baseline(
     lm_base_url = base_url or "http://localhost:1234/v1"
 
     try:
-        model, tokenizer = load_llm_model(model_repo, base_url=lm_base_url)
+        client = load_llm_model(model_repo, base_url=lm_base_url)
         print()
     except Exception as e:
         raise RuntimeError(
@@ -222,7 +200,6 @@ def evaluate_llm_baseline(
     unnormalized_windows = data["unnormalized_windows"]
     sensor_labels_true = data["sensor_labels"]
     window_labels_true = data["window_labels"]
-    normalized_windows = data.get("normalized_windows", unnormalized_windows)
 
     # Load metadata
     metadata_path = dataset_path.parent / f"{dataset_path.stem}_metadata.json"
@@ -262,48 +239,11 @@ def evaluate_llm_baseline(
     print(f"  Sensors: {len(sensor_names)}")
     print()
 
-    # Get sensor_scores and sensor_threshold (for fair comparison with KAG)
-    sensor_scores_per_window = []
     sensor_threshold = 0.30
-    if model_path is not None:
-        try:
-            import torch
-            from kg.create_kg import GDNPredictor
-            checkpoint = torch.load(model_path, map_location="cpu")
-            sensor_threshold = float(checkpoint.get("sensor_threshold", 0.30))
-            embed_dim = 32
-            if "sensor_embeddings" in checkpoint:
-                embed_dim = checkpoint["sensor_embeddings"].shape[1]
-            predictor = GDNPredictor(
-                model_path=str(model_path),
-                sensor_names=sensor_names,
-                window_size=300,
-                embed_dim=embed_dim,
-                top_k=3,
-                hidden_dim=32,
-                device="cpu",
-            )
-            gdn_preds = predictor.predict(normalized_windows[:num_windows], batch_size=32)
-            for wi in range(gdn_preds.shape[0]):
-                sensor_scores_per_window.append({
-                    sensor_names[i]: float(gdn_preds[wi, i])
-                    for i in range(len(sensor_names))
-                })
-            print(f"  Loaded GDN sensor scores, sensor_threshold={sensor_threshold:.2f}")
-        except Exception as e:
-            print(f"  ⚠️  GDN load failed: {e}, using empty sensor_scores")
-            sensor_scores_per_window = [{} for _ in range(num_windows)]
-    else:
-        sensor_scores_per_window = [{} for _ in range(num_windows)]
-        print(f"  No model_path: using sensor_threshold={sensor_threshold:.2f}, empty sensor_scores")
-    print()
+    sensor_scores_per_window = [{} for _ in range(num_windows)]
 
-    # Create OpenAI client for structured output (LM Studio compatible)
-    client = OpenAI(
-        base_url=model.base_url,
-        api_key="lm-studio",
-    )
-    model_name = model.model_name
+    # Get model name from the client (already created above)
+    model_name = client.config.model_name
 
     # Run predictions
     print("Running LLM predictions...")
@@ -415,7 +355,6 @@ def evaluate_llm_baseline(
         "total_processing_time_seconds": float(total_processing_time),
         "windows_per_second": float(num_windows / total_processing_time),
         "avg_context_length_tokens": float(avg_context_length),
-        "use_statistical_features": use_statistical_features,
     }
 
     # Print report
@@ -447,7 +386,7 @@ def evaluate_llm_baseline(
     return results
 
 
-def run(dataset_path: str, model_path: str, lm_url: str, limit: Optional[int] = None) -> dict:
+def run(dataset_path: str, lm_url: str, limit: Optional[int] = None) -> dict:
     """
     Run LLM baseline evaluation and return unified format for compare_methods.
 
@@ -458,7 +397,6 @@ def run(dataset_path: str, model_path: str, lm_url: str, limit: Optional[int] = 
     res = evaluate_llm_baseline(
         dataset_path=Path(dataset_path),
         output_path=None,
-        model_path=Path(model_path) if model_path else None,
         base_url=lm_url,
         limit=limit,
     )
@@ -512,7 +450,10 @@ def main():
         description="Evaluate LLM baseline on shared evaluation dataset"
     )
     parser.add_argument(
-        "--dataset", type=str, required=True, help="Path to shared dataset .npz file"
+        "--dataset",
+        type=str,
+        default="data/shared_dataset/test.npz",
+        help="Path to shared dataset .npz file (default: data/shared_dataset/test.npz)",
     )
     parser.add_argument(
         "--output",
@@ -521,22 +462,10 @@ def main():
         help="Output path for results JSON",
     )
     parser.add_argument(
-        "--use-statistical-features",
-        action="store_true",
-        default=True,
-        help="Include statistical features in LLM prompts",
-    )
-    parser.add_argument(
         "--model-repo",
         type=str,
         default="granite-4.0-h-micro-GGUF",
         help="Model name in LM Studio (default: granite-4.0-h-micro-GGUF)",
-    )
-    parser.add_argument(
-        "--model-path",
-        type=str,
-        default=None,
-        help="Optional GDN checkpoint for sensor_scores (fair comparison with KAG)",
     )
     parser.add_argument(
         "--limit",
@@ -550,9 +479,7 @@ def main():
     evaluate_llm_baseline(
         dataset_path=Path(args.dataset),
         output_path=Path(args.output),
-        use_statistical_features=args.use_statistical_features,
         model_repo=args.model_repo,
-        model_path=Path(args.model_path) if args.model_path else None,
         limit=args.limit,
     )
 
