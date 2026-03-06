@@ -23,6 +23,7 @@ checkpoints/
 *.pth
 
 # Generated data
+data/shared_dataset/
 llm/evaluation/shared_dataset/
 demo/demo_cache.pkl
 
