@@ -1,10 +1,8 @@
 from pydantic import BaseModel
 from typing import List, Literal
+from training.fault_injection import STATE_NAMES
 
-VALID_FAULT_TYPES = Literal[
-    "sensor_drift", "signal_spike", "flatline",
-    "cluster_fault", "inconsistency", "normal"
-]
+VALID_FAULT_TYPES = Literal[STATE_NAMES]
 
 
 class FaultDiagnosis(BaseModel):
