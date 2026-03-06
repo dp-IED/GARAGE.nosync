@@ -84,6 +84,12 @@ class GDN(nn.Module):
             # No sigmoid - use BCEWithLogitsLoss instead
         )
 
+        # Per-sensor output bias initialized from class prior
+        # Helps the model learn better priors, especially for rare classes
+        # Initialized to log(0.03) ~ -3.5 for 3% positive rate
+        initial_bias = torch.tensor([-3.5] * num_nodes, dtype=torch.float32)
+        self.sensor_output_bias = nn.Parameter(initial_bias)
+
         # Global window classifier: concat(mean_pool(h_graph), sensor_logits) for coupling
         self.global_classifier = nn.Sequential(
             nn.Linear(hidden_dim + num_nodes, 64),
@@ -92,6 +98,10 @@ class GDN(nn.Module):
             nn.Linear(64, 1),
             # No sigmoid - use BCEWithLogitsLoss instead
         )
+
+        # Learnable temperature parameter for threshold stability
+        # Allows the model to learn its own decision boundary during training
+        self.window_temp = nn.Parameter(torch.ones(1))
 
     def build_graph_from_embeddings(self, force_rebuild=False):
         """
@@ -161,24 +171,36 @@ class GDN(nn.Module):
         sensor_bias = self.sensor_proj(self.sensor_embeddings)  # (N, hidden_dim)
         h_last_norm = h_last_norm + sensor_bias.unsqueeze(0)  # broadcast over batch
 
-        # GAT processing (per-batch loop, but with residual)
-        # PyTorch Geometric requires CPU for node features and edge_index
-        h_graph_list = []
-        for i in range(B):
-            h_node = h_last_norm[i]  # (N, hidden_dim)
-            # Move to CPU for GAT (PyG doesn't fully support CUDA/MPS)
-            h_node_cpu = h_node.cpu()
-            h_gat_cpu = self.gat(h_node_cpu, edge_index)
-            h_gat = h_gat_cpu.to(h_node.device)
-            # Residual connection: preserve sensor distinctiveness
-            h_gat = h_gat + h_last_norm[i]  # Residual
-            h_gat = self.gat_norm(h_gat)  # Normalize
-            h_graph_list.append(h_gat)
+        # BATCHED GAT processing - properly batch all samples together
+        # Flatten: (B, N, H) -> (B*N, H)
+        h_last_flat = h_last_norm.reshape(B * N, -1)  # (B*N, hidden_dim)
 
-        h_graph = torch.stack(h_graph_list, dim=0)  # (B, N, hidden_dim)
+        # Tile edge_index for batch: (2, num_edges) -> (2, B*num_edges)
+        # Each sample in the batch gets its own copy of the graph
+        edge_index_cpu = edge_index.cpu()  # PyG requires CPU edge_index
+        num_edges = edge_index.shape[1]
+        # Create batched edge indices with offsets
+        batch_edge_list = []
+        for i in range(B):
+            # Add node offset for this batch item
+            batch_edge_list.append(edge_index_cpu + i * N)
+        batch_edge_index = torch.cat(batch_edge_list, dim=1)  # (2, B*num_edges)
+
+        # Run GAT on batched graph
+        h_gat_flat_cpu = self.gat(h_last_flat.cpu(), batch_edge_index)
+        h_gat_flat = h_gat_flat_cpu.to(h_last.device)
+
+        # Reshape back: (B*N, H) -> (B, N, H)
+        h_gat = h_gat_flat.reshape(B, N, -1)
+
+        # Residual connection: preserve sensor distinctiveness
+        h_graph = h_gat + h_last_norm
+        h_graph = self.gat_norm(h_graph)  # Normalize
 
         # Per-sensor anomaly logits (no sigmoid - use BCEWithLogitsLoss)
         sensor_logits = self.sensor_classifier(h_graph).squeeze(-1)  # (B, N)
+        # Add per-sensor output bias for better priors
+        sensor_logits = sensor_logits + self.sensor_output_bias  # (B, N)
 
         # Prepare return values
         return_values = [sensor_logits]
@@ -189,6 +211,8 @@ class GDN(nn.Module):
                 [h_graph.mean(dim=1), sensor_logits], dim=1
             )  # (B, hidden_dim + N)
             global_logits = self.global_classifier(global_input).squeeze(-1)  # (B,)
+            # Apply learnable temperature for threshold stability
+            global_logits = global_logits * self.window_temp
             return_values.append(global_logits)
 
         if return_sensor_embeddings:
@@ -229,20 +253,23 @@ class GDN(nn.Module):
         sensor_bias = self.sensor_proj(self.sensor_embeddings)  # (N, hidden_dim)
         h_last_norm = h_last_norm + sensor_bias.unsqueeze(0)  # broadcast over batch
 
-        # GAT processing with residual
-        # PyTorch Geometric requires CPU for node features and edge_index
-        h_graph_list = []
-        for i in range(B):
-            h_node = h_last_norm[i]  # (N, hidden_dim)
-            # Move to CPU for GAT (PyG doesn't fully support CUDA/MPS)
-            h_node_cpu = h_node.cpu()
-            h_gat_cpu = self.gat(h_node_cpu, edge_index)
-            h_gat = h_gat_cpu.to(h_node.device)
-            h_gat = h_gat + h_last_norm[i]  # Residual
-            h_gat = self.gat_norm(h_gat)  # Normalize
-            h_graph_list.append(h_gat)
+        # BATCHED GAT processing (same as forward)
+        h_last_flat = h_last_norm.reshape(B * N, -1)  # (B*N, hidden_dim)
 
-        h_graph = torch.stack(h_graph_list, dim=0)  # (B, N, hidden_dim)
+        edge_index_cpu = edge_index.cpu()
+        num_edges = edge_index.shape[1]
+        batch_edge_list = []
+        for i in range(B):
+            batch_edge_list.append(edge_index_cpu + i * N)
+        batch_edge_index = torch.cat(batch_edge_list, dim=1)
+
+        h_gat_flat_cpu = self.gat(h_last_flat.cpu(), batch_edge_index)
+        h_gat_flat = h_gat_flat_cpu.to(h_last.device)
+        h_gat = h_gat_flat.reshape(B, N, -1)
+
+        # Residual + norm
+        h_graph = h_gat + h_last_norm
+        h_graph = self.gat_norm(h_graph)  # Normalize
 
         # Aggregate across sensors: mean pooling
         embeddings = h_graph.mean(dim=1)  # (B, hidden_dim)
@@ -285,20 +312,23 @@ class GDN(nn.Module):
         sensor_bias = self.sensor_proj(self.sensor_embeddings)  # (N, hidden_dim)
         h_last_norm = h_last_norm + sensor_bias.unsqueeze(0)  # broadcast over batch
 
-        # GAT processing with residual
-        # PyTorch Geometric requires CPU for node features and edge_index
-        h_graph_list = []
-        for i in range(B):
-            h_node = h_last_norm[i]  # (N, hidden_dim)
-            # Move to CPU for GAT (PyG doesn't fully support CUDA/MPS)
-            h_node_cpu = h_node.cpu()
-            h_gat_cpu = self.gat(h_node_cpu, edge_index)
-            h_gat = h_gat_cpu.to(h_node.device)
-            h_gat = h_gat + h_last_norm[i]  # Residual
-            h_gat = self.gat_norm(h_gat)  # Normalize
-            h_graph_list.append(h_gat)
+        # BATCHED GAT processing (same as forward)
+        h_last_flat = h_last_norm.reshape(B * N, -1)  # (B*N, hidden_dim)
 
-        h_graph = torch.stack(h_graph_list, dim=0)  # (B, N, hidden_dim)
+        edge_index_cpu = edge_index.cpu()
+        num_edges = edge_index.shape[1]
+        batch_edge_list = []
+        for i in range(B):
+            batch_edge_list.append(edge_index_cpu + i * N)
+        batch_edge_index = torch.cat(batch_edge_list, dim=1)
+
+        h_gat_flat_cpu = self.gat(h_last_flat.cpu(), batch_edge_index)
+        h_gat_flat = h_gat_flat_cpu.to(h_last.device)
+        h_gat = h_gat_flat.reshape(B, N, -1)
+
+        # Residual + norm
+        h_graph = h_gat + h_last_norm
+        h_graph = self.gat_norm(h_graph)  # Normalize
 
         # Use POST-GAT embeddings to match window embedding space
         # Window embeddings: normalize(mean(h_graph))
