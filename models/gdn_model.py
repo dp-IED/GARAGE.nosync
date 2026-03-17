@@ -54,7 +54,7 @@ class GDN(nn.Module):
         # Projects sensor identity into hidden_dim space for differentiable node injection
         self.sensor_proj = nn.Linear(embed_dim, hidden_dim, bias=False)
 
-        # Single-layer unidirectional GRU (baseline - fast)
+        # Single-layer unidirectional Gated Recurrent Unit (GRU)
         self.temporal_encoder = nn.GRU(
             input_size=1,
             hidden_size=hidden_dim,
