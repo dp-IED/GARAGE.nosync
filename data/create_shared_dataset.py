@@ -200,8 +200,9 @@ def process_split(
     # 2. Inject faults into normalized clean windows
     # ------------------------------------------------------------------ #
     fault_pct = TEST_FAULT_PCT if split == "test" else TRAIN_VAL_FAULT_PCT
-    # Stage 2 val uses seed 43 to match train_stage2.py exactly
-    fault_seed = 43 if split == "val" else random_state
+    # Each split uses a distinct RNG stream to avoid shared fault-injection sequences:
+    # train=random_state (42), val=43, test=44
+    fault_seed = {"val": 43, "test": random_state + 2}.get(split, random_state)
 
     print(f"  Injecting faults ({fault_pct * 100:.0f}%, seed={fault_seed})...")
     X_clean_tensor = torch.tensor(X_clean_norm, dtype=torch.float32)
