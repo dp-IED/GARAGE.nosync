@@ -36,35 +36,31 @@ from llm.evaluation.utils import parse_structured_response, parsed_to_prediction
 
 SYSTEM_PROMPT = (
     "You are an automotive fault diagnostics system. You will receive "
-    "structured sensor graph data from an OBD-II vehicle. Identify faulty "
+    "raw OBD-II sensor time-series data from a vehicle. Identify faulty "
     "sensors and classify the fault type. Only use sensor names from the "
     "provided valid list. Respond with JSON only."
 )
 
 
 def build_baseline_prompt(
-    window_idx: int,
-    sensor_scores: Dict[str, float],
-    sensor_cols: List[str],
-    sensor_threshold: float,
+    window_data: np.ndarray,
+    sensor_names: List[str],
 ) -> List[Dict[str, str]]:
-    above_threshold = [
-        (name, score) for name, score in sensor_scores.items()
-        if score > sensor_threshold
-    ]
-    above_threshold.sort(key=lambda x: x[1], reverse=True)
+    """
+    Build prompt with serialised raw unnormalised sensor time series.
+    window_data shape: (300, 8) — timesteps × sensors.
+    """
+    series_dict = {}
+    for col_idx, name in enumerate(sensor_names):
+        values = window_data[:, col_idx].tolist()
+        series_dict[name] = [round(float(v), 3) for v in values]
 
     lines = []
-    lines.append(f"ANOMALOUS SENSORS (score > {sensor_threshold:.2f}):")
-    if above_threshold:
-        for name, score in above_threshold:
-            lines.append(f"  {name}: anomaly_score={score:.3f}")
-    else:
-        lines.append("  (none above threshold)")
-
+    lines.append("SENSOR TIME SERIES (300 timesteps per sensor):")
+    lines.append(json.dumps(series_dict))
     lines.append("")
     lines.append("VALID SENSOR NAMES (use exactly these in faulty_sensors field):")
-    lines.append(", ".join(sensor_cols))
+    lines.append(", ".join(sensor_names))
 
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -89,9 +85,83 @@ def _call_llm_structured(
         messages=messages,
         response_format=response_format,
         temperature=0.0,
-        max_tokens=256,
     )
     return response["choices"][0]["message"]["content"]
+
+
+INVALID_FAULT_TYPE_LABELS = frozenset({"normal", "unknown", "faulty", ""})
+
+
+def _validate_fault_types_for_stratification(
+    fault_types: np.ndarray,
+    sensor_labels: np.ndarray,
+) -> None:
+    """
+    Assert fault_types exists and every faulty window has a valid fault type.
+    Raises ValueError if any faulty window lacks a proper fault type.
+    """
+    faulty_mask = sensor_labels.sum(axis=1) != 0
+    faulty_indices = np.where(faulty_mask)[0]
+    if len(faulty_indices) == 0:
+        return
+    for i in faulty_indices:
+        ft = fault_types[i]
+        ft_str = (str(ft).strip() if ft is not None else "")
+        if ft is None or ft_str in INVALID_FAULT_TYPE_LABELS:
+            raise ValueError(
+                f"Stratified limit requires valid fault_types for every faulty window. "
+                f"Window {i} has sensor_labels.sum(axis=1) != 0 but fault_types[{i}] = {ft!r} "
+                f"(None, empty, 'normal', 'unknown', or 'faulty' are invalid for faulty windows)."
+            )
+
+
+def _stratified_sample_indices(
+    fault_types: np.ndarray,
+    limit: int,
+    random_state: int = 42,
+) -> np.ndarray:
+    """
+    Sample indices stratified by fault type, preserving full-dataset proportions.
+    Returns sorted indices for deterministic ordering.
+    """
+    n = len(fault_types)
+    if limit >= n:
+        return np.arange(n)
+
+    ft_str = np.array(
+        [(str(ft).strip() or "normal") if ft is not None else "normal" for ft in fault_types]
+    )
+    unique = np.unique(ft_str)
+    stratum_indices = {ft: np.where(ft_str == ft)[0] for ft in unique}
+    stratum_sizes = {ft: len(idxs) for ft, idxs in stratum_indices.items()}
+    total = sum(stratum_sizes.values())
+
+    targets = {}
+    for ft in unique:
+        raw = limit * stratum_sizes[ft] / total
+        targets[ft] = max(0, min(stratum_sizes[ft], int(np.floor(raw))))
+
+    current_sum = sum(targets.values())
+    remainder = limit - current_sum
+    if remainder > 0:
+        fracs = [(limit * stratum_sizes[ft] / total - targets[ft], ft) for ft in unique]
+        fracs.sort(key=lambda x: -x[0])
+        for _, ft in fracs:
+            if remainder <= 0:
+                break
+            add = min(remainder, stratum_sizes[ft] - targets[ft])
+            targets[ft] += add
+            remainder -= add
+
+    rng = np.random.default_rng(random_state)
+    sampled = []
+    for ft in unique:
+        idxs = stratum_indices[ft]
+        k = min(targets[ft], len(idxs))
+        chosen = rng.choice(idxs, size=k, replace=False)
+        sampled.extend(chosen.tolist())
+
+    return np.sort(np.array(sampled))
 
 
 def filter_sensor_labels_to_root_only(parsed_result: Dict, sensor_names: List[str]) -> np.ndarray:
@@ -134,6 +204,7 @@ def filter_sensor_labels_to_root_only(parsed_result: Dict, sensor_names: List[st
 def load_llm_model(
     model_repo: str = "granite-4.0-h-micro-GGUF",
     base_url: str = "http://localhost:1234/v1",
+    timeout: int = 120,
 ) -> LMStudioClient:
     """
     Load LLM model via LM Studio HTTP server.
@@ -141,14 +212,16 @@ def load_llm_model(
     Args:
         model_repo: Model name in LM Studio (default: granite-4.0-h-micro-GGUF)
         base_url: Base URL for LM Studio HTTP server
+        timeout: Request timeout in seconds (default 120; first request may need warmup)
 
     Returns:
         LMStudioClient instance
     """
-    print(f"Connecting to LM Studio for model: {model_repo}")
+    print(f"Connecting to LM Studio for model: {model_repo} (timeout={timeout}s)")
     client = create_client(
         model_name=model_repo,
         base_url=base_url,
+        timeout=timeout,
         check_connection=True
     )
     return client
@@ -160,6 +233,8 @@ def evaluate_llm_baseline(
     model_repo: Optional[str] = None,
     base_url: Optional[str] = None,
     limit: Optional[int] = None,
+    seed: int = 42,
+    timeout: int = 120,
 ) -> Dict[str, any]:
     """
     Evaluate LLM baseline on shared dataset.
@@ -185,7 +260,7 @@ def evaluate_llm_baseline(
     lm_base_url = base_url or "http://localhost:1234/v1"
 
     try:
-        client = load_llm_model(model_repo, base_url=lm_base_url)
+        client = load_llm_model(model_repo, base_url=lm_base_url, timeout=timeout)
         print()
     except Exception as e:
         raise RuntimeError(
@@ -223,24 +298,33 @@ def evaluate_llm_baseline(
         statistical_features = None
 
     num_windows = unnormalized_windows.shape[0]
+    num_windows_full = num_windows
+    fault_types_full = data.get("fault_types", None)
+    sample_indices = None
 
-    # Apply limit if specified
-    if limit is not None and limit > 0:
-        num_windows = min(num_windows, limit)
-        unnormalized_windows = unnormalized_windows[:num_windows]
-        sensor_labels_true = sensor_labels_true[:num_windows]
-        window_labels_true = window_labels_true[:num_windows]
-        if statistical_features is not None:
-            statistical_features = statistical_features[:num_windows]
-        print(f"  ⚠️  LIMIT MODE: Processing only {num_windows} windows")
+    if limit is not None and limit > 0 and limit < num_windows:
+        if fault_types_full is None:
+            raise ValueError(
+                "Stratified limit requires fault_types in the dataset. "
+                "The .npz file must contain a 'fault_types' array."
+            )
+        _validate_fault_types_for_stratification(fault_types_full, sensor_labels_true)
+        sample_indices = _stratified_sample_indices(
+            fault_types_full, limit, random_state=seed
+        )
+        num_windows = len(sample_indices)
+        unnormalized_windows = unnormalized_windows[sample_indices]
+        sensor_labels_true = sensor_labels_true[sample_indices]
+        window_labels_true = window_labels_true[sample_indices]
+        fault_types_full = fault_types_full[sample_indices]
+        if statistical_features is not None and len(statistical_features) == num_windows_full:
+            statistical_features = statistical_features[sample_indices]
+        print(f"  ⚠️  LIMIT MODE: Stratified sample of {num_windows} windows (seed={seed})")
 
     print(f"  Loaded {num_windows} windows")
     print(f"  Window size: {unnormalized_windows.shape[1]}")
     print(f"  Sensors: {len(sensor_names)}")
     print()
-
-    sensor_threshold = 0.30
-    sensor_scores_per_window = [{} for _ in range(num_windows)]
 
     # Get model name from the client (already created above)
     model_name = client.config.model_name
@@ -258,9 +342,8 @@ def evaluate_llm_baseline(
     with tqdm(total=num_windows, desc="LLM Inference", unit="window") as pbar:
         for window_idx in range(num_windows):
             start_time = time.time()
-            sensor_scores = sensor_scores_per_window[window_idx]
             messages = build_baseline_prompt(
-                window_idx, sensor_scores, sensor_names, sensor_threshold
+                unnormalized_windows[window_idx], sensor_names
             )
             context_length = sum(len(m.get("content", "").split()) for m in messages)
 
@@ -269,6 +352,8 @@ def evaluate_llm_baseline(
                 parsed = parse_structured_response(raw_json, sensor_names)
                 prediction = parsed_to_prediction(parsed, sensor_names)
             except Exception as e:
+                if window_idx == 0:
+                    print(f"  ⚠️  LLM error on first window: {e}")
                 empty_labels = np.zeros(len(sensor_names), dtype=np.float32)
                 prediction = {
                     "window_label": 0,
@@ -326,7 +411,6 @@ def evaluate_llm_baseline(
 
     # Compute metrics
     print("Computing evaluation metrics...")
-    fault_types_true = data.get("fault_types", None)
 
     # Compute metrics using filtered (root-only) predictions for precision improvement
     metrics = compute_all_metrics(
@@ -335,7 +419,7 @@ def evaluate_llm_baseline(
         y_true_sensor=sensor_labels_true,
         y_pred_sensor=sensor_labels_pred,  # Use filtered (root-only) for main metrics
         sensor_names=sensor_names,
-        fault_types=fault_types_true if fault_types_true is not None else None,
+        fault_types=fault_types_full if fault_types_full is not None else None,
     )
     
     # Also compute raw metrics for comparison
@@ -345,7 +429,7 @@ def evaluate_llm_baseline(
         y_true_sensor=sensor_labels_true,
         y_pred_sensor=sensor_labels_pred_raw,  # Use raw (all sensors) for comparison
         sensor_names=sensor_names,
-        fault_types=fault_types_true if fault_types_true is not None else None,
+        fault_types=fault_types_full if fault_types_full is not None else None,
     )
     metrics["sensor_level_raw"] = metrics_raw["sensor_level"]
 
@@ -375,6 +459,8 @@ def evaluate_llm_baseline(
             "reasoning": reasoning_list,
         },
     }
+    if sample_indices is not None:
+        results["sample_indices"] = sample_indices.tolist()
 
     if output_path:
         output_path = Path(output_path)
@@ -386,7 +472,7 @@ def evaluate_llm_baseline(
     return results
 
 
-def run(dataset_path: str, lm_url: str, limit: Optional[int] = None) -> dict:
+def run(dataset_path: str, lm_url: str, limit: Optional[int] = None, seed: int = 42) -> dict:
     """
     Run LLM baseline evaluation and return unified format for compare_methods.
 
@@ -399,11 +485,27 @@ def run(dataset_path: str, lm_url: str, limit: Optional[int] = None) -> dict:
         output_path=None,
         base_url=lm_url,
         limit=limit,
+        seed=seed,
     )
     preds = res["predictions"]
     data = np.load(dataset_path, allow_pickle=True)
     sensor_labels_true = data["sensor_labels"]
     fault_types = data.get("fault_types", None)
+
+    sample_indices = res.get("sample_indices")
+    if sample_indices is not None:
+        sample_indices = np.array(sample_indices)
+        sensor_labels_true = sensor_labels_true[sample_indices]
+        if fault_types is not None:
+            fault_types = fault_types[sample_indices]
+    ref_reason = data.get("reference_reasoning", None)
+    if ref_reason is not None:
+        ref_reason = np.asarray(ref_reason)
+        if sample_indices is not None:
+            ref_reason = ref_reason[sample_indices]
+        ref_reason = ref_reason.tolist()
+    else:
+        ref_reason = [""] * len(sensor_labels_true)
     sensor_names = res.get("sensor_names", [])
     if not sensor_names and "dataset_info" in res:
         sensor_names = res["dataset_info"].get("sensor_names", [])
@@ -471,7 +573,19 @@ def main():
         "--limit",
         type=int,
         default=None,
-        help="Limit number of windows to process (for testing)",
+        help="Limit number of windows to process (stratified by fault type)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for stratified sampling when --limit is used (default: 42)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=120,
+        help="LLM request timeout in seconds (default: 120; increase if first request times out)",
     )
 
     args = parser.parse_args()
@@ -481,6 +595,8 @@ def main():
         output_path=Path(args.output),
         model_repo=args.model_repo,
         limit=args.limit,
+        seed=args.seed,
+        timeout=args.timeout,
     )
 
 

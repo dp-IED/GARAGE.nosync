@@ -275,6 +275,39 @@ def run_kg_sanity_check(
             print("OK: KG context appears non-trivial (anomaly propagation present).")
         else:
             print("Warning: KG context may be trivial (few or no propagation chains).")
+
+        # Per-faulty-window diagnostic: are violations and anomaly_propagation populated?
+        faulty_mask = (sensor_labels_true.sum(axis=1) > 0)
+        n_faulty = int(faulty_mask.sum())
+        if n_faulty > 0:
+            n_with_violations = 0
+            n_with_propagation = 0
+            n_with_either = 0
+            n_with_both = 0
+            for idx in range(num_windows):
+                if not faulty_mask[idx]:
+                    continue
+                ctx = kg.get_window_kg(idx, temporal_context_windows=2)
+                has_v = len(ctx.get("violations", [])) > 0
+                has_p = len(ctx.get("anomaly_propagation", [])) > 0
+                if has_v:
+                    n_with_violations += 1
+                if has_p:
+                    n_with_propagation += 1
+                if has_v or has_p:
+                    n_with_either += 1
+                if has_v and has_p:
+                    n_with_both += 1
+            print()
+            print("Per-faulty-window KG context (LLM prompt substance):")
+            print(f"  Faulty windows: {n_faulty}")
+            print(f"  With violations: {n_with_violations} ({100 * n_with_violations / n_faulty:.1f}%)")
+            print(f"  With anomaly_propagation: {n_with_propagation} ({100 * n_with_propagation / n_faulty:.1f}%)")
+            print(f"  With either: {n_with_either} ({100 * n_with_either / n_faulty:.1f}%)")
+            print(f"  With both: {n_with_both} ({100 * n_with_both / n_faulty:.1f}%)")
+            if n_with_either < n_faulty * 0.5:
+                print("  ⚠️  Sparse KG context: many faulty windows lack violations/propagation.")
+                print("      LLM gets prompt structure but little substance → poor fault typing.")
     except Exception as e:
         print(f"Error during KG sanity check: {e}")
     finally:
@@ -337,9 +370,17 @@ def evaluate_gdn_only(
         window_is_faulty_true = window_is_faulty_true[:num_windows]
         print(f"  ⚠️  LIMIT MODE: Processing only {num_windows} windows")
 
-    # Load GDN checkpoint and detect parameters
+    # Load GDN checkpoint and detect parameters (prefer stage2 calibrated thresholds)
     checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
-    sensor_threshold = float(checkpoint.get("sensor_threshold", 0.30))
+    calibrated = checkpoint.get("calibrated_thresholds") or {}
+    sensor_threshold = float(
+        calibrated.get("sensor", checkpoint.get("sensor_threshold", 0.30))
+    )
+    per_sensor_thr = calibrated.get("per_sensor")
+    if per_sensor_thr is not None:
+        per_sensor_thr = np.array(per_sensor_thr, dtype=np.float32)
+        if len(per_sensor_thr) != len(sensor_names):
+            per_sensor_thr = None
     embed_dim = 32
     if "sensor_embeddings" in checkpoint:
         embed_dim = checkpoint["sensor_embeddings"].shape[1]
@@ -359,8 +400,11 @@ def evaluate_gdn_only(
     print("Running GDN inference...")
     gdn_preds = predictor.predict(normalized_windows[:num_windows], batch_size=32)
 
-    # Threshold predictions
-    sensor_labels_pred = (gdn_preds > sensor_threshold).astype(np.float32)
+    # Threshold predictions (per-sensor if calibrated, else scalar)
+    if per_sensor_thr is not None:
+        sensor_labels_pred = (gdn_preds > per_sensor_thr).astype(np.float32)
+    else:
+        sensor_labels_pred = (gdn_preds > sensor_threshold).astype(np.float32)
     window_labels_pred = (sensor_labels_pred.sum(axis=1) > 0).astype(int)
 
     # Compute metrics
@@ -541,7 +585,7 @@ def evaluate_gdn_kg_llm(
     kg = KnowledgeGraph(
         sensor_names=sensor_names,
         sensor_embeddings=kg_preds["sensor_embeddings"],
-        adjacency_matrix=kg_preds["adjacency_matrix"] if use_adjacency_matrix else None,
+        adjacency_matrix=kg_preds["adjacency_matrix"],
     )
 
     kg.construct(
@@ -566,6 +610,39 @@ def evaluate_gdn_kg_llm(
         print("OK: KG context appears non-trivial (anomaly propagation present).")
     else:
         print("Warning: KG context may be trivial (few or no propagation chains).")
+
+    # Per-faulty-window diagnostic: are violations and anomaly_propagation populated?
+    faulty_mask = (sensor_labels_true.sum(axis=1) > 0)
+    n_faulty = int(faulty_mask.sum())
+    if n_faulty > 0:
+        n_with_violations = 0
+        n_with_propagation = 0
+        n_with_either = 0
+        n_with_both = 0
+        for idx in range(num_windows):
+            if not faulty_mask[idx]:
+                continue
+            ctx = kg.get_window_kg(idx, temporal_context_windows=2)
+            has_v = len(ctx.get("violations", [])) > 0
+            has_p = len(ctx.get("anomaly_propagation", [])) > 0
+            if has_v:
+                n_with_violations += 1
+            if has_p:
+                n_with_propagation += 1
+            if has_v or has_p:
+                n_with_either += 1
+            if has_v and has_p:
+                n_with_both += 1
+        print()
+        print("Per-faulty-window KG context (LLM prompt substance):")
+        print(f"  Faulty windows: {n_faulty}")
+        print(f"  With violations: {n_with_violations} ({100 * n_with_violations / n_faulty:.1f}%)")
+        print(f"  With anomaly_propagation: {n_with_propagation} ({100 * n_with_propagation / n_faulty:.1f}%)")
+        print(f"  With either: {n_with_either} ({100 * n_with_either / n_faulty:.1f}%)")
+        print(f"  With both: {n_with_both} ({100 * n_with_both / n_faulty:.1f}%)")
+        if n_with_either < n_faulty * 0.5:
+            print("  ⚠️  Sparse KG context: many faulty windows lack violations/propagation.")
+            print("      LLM gets prompt structure but little substance → poor fault typing.")
     print()
 
     # Run LLM predictions with KG context
@@ -857,6 +934,11 @@ def main():
         help="Run KG sanity check only (verify violations/propagation non-trivial, then exit)",
     )
     parser.add_argument(
+        "--sanity-check-full",
+        action="store_true",
+        help="Run sanity check on full dataset (default: sample of 3 windows)",
+    )
+    parser.add_argument(
         "--mode",
         type=str,
         choices=["full", "gdn_only"],
@@ -872,7 +954,7 @@ def main():
             model_path=Path(args.model_path),
             batch_size=args.batch_size,
             device=args.device,
-            sample_windows=[100, 500, 1000],
+            sample_windows=None if args.sanity_check_full else [100, 500, 1000],
         )
         return
 
