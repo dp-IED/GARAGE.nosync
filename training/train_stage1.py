@@ -48,14 +48,13 @@ ID_COL = "drive_id"
 TIME_COL = "ENGINE_RUN_TINE ()"
 WINDOW_SIZE = 300
 
-# Drive split ratios: 70/15/15 for larger test set
 TRAIN_RATIO = 0.70
 VAL_RATIO = 0.15
 TEST_RATIO = 0.15
 FORECAST_HORIZONS = [1, 5, 10]  # Multi-horizon forecasting
 
 # Training hyperparameters
-NUM_EPOCHS = 75  # Default: 50-100 epochs
+NUM_EPOCHS = 75  # Recommended: 140 epochs
 BATCH_SIZE = 32
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4

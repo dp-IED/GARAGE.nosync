@@ -42,7 +42,6 @@ from training.train_stage1 import (
     WINDOW_SIZE,
 )
 
-
 def build_clean_windows(
     df,
     sensor_cols,
@@ -84,10 +83,12 @@ torch.set_default_dtype(torch.float32)
 # ============================================================================
 # Constants
 # ============================================================================
-NUM_EPOCHS = 40
+NUM_EPOCHS = 75  # Recommended: 140 epochs
 BATCH_SIZE = 32
 LEARNING_RATE = 5e-4
 WEIGHT_DECAY = 1e-4
+
+# Model architecture
 EMBED_DIM = 32  # Doubled from 16 for more capacity
 TOP_K = 7
 HIDDEN_DIM = 64  # Doubled from 32 for more capacity
@@ -439,7 +440,6 @@ def train_stage2_clean(
     hard_mining_seed: int = 42,
     hard_mining_start_epoch: int = 0,
     window_score_weight: float = WINDOW_SCORE_WEIGHT,
-    lambda_aux_global: float = 0.2,
     window_pos_weight: float = 1.0,
     use_fixed_train_threshold: bool = True,
     train_window_thr: float = 0.5,
@@ -1239,12 +1239,6 @@ def main():
         help="Window BCE coefficient",
     )
     parser.add_argument(
-        "--lambda_aux_global",
-        type=float,
-        default=0.2,
-        help="Auxiliary BCE on global_logits so global branch gets gradient",
-    )
-    parser.add_argument(
         "--window_pos_weight",
         type=float,
         default=1.0,
@@ -1598,7 +1592,6 @@ def main():
         device=device,
         lambda_sensor=args.lambda_sensor,
         lambda_window=args.lambda_window,
-        lambda_aux_global=args.lambda_aux_global,
         learning_rate=args.lr,
         weight_decay=WEIGHT_DECAY,
         checkpoint_dir=args.checkpoint_dir,
