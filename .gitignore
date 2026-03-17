@@ -1,5 +1,6 @@
 .claude/
 .cursor/
+.context/
 
 # Python
 __pycache__/
