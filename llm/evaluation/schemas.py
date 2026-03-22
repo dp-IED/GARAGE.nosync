@@ -1,12 +1,10 @@
 from pydantic import BaseModel
-from typing import List, Literal
-from training.fault_injection import STATE_NAMES
-
-VALID_FAULT_TYPES = Literal[STATE_NAMES]
+from typing import List, Literal, Optional
 
 
 class FaultDiagnosis(BaseModel):
+    is_faulty: bool
     faulty_sensors: List[str]
-    fault_type: VALID_FAULT_TYPES
+    fault_type: str
     confidence: Literal["high", "medium", "low"]
     reasoning: str

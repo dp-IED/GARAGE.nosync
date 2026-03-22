@@ -108,39 +108,6 @@ SENSOR_DESCRIPTIONS = {
     },
 }
 
-EXPECTED_CORRELATIONS = {
-    ("ENGINE_RPM ()", "VEHICLE_SPEED ()"): {
-        "type": "expected_to_increase_with",
-        "strength": "strong",
-        "description": "RPM and vehicle speed should correlate positively under normal conditions",
-    },
-    ("THROTTLE ()", "ENGINE_LOAD ()"): {
-        "type": "expected_to_increase_with",
-        "strength": "strong",
-        "description": "Throttle position and engine load should increase together",
-    },
-    ("THROTTLE ()", "INTAKE_MANIFOLD_PRESSURE ()"): {
-        "type": "expected_to_increase_with",
-        "strength": "moderate",
-        "description": "Throttle opening increases intake manifold pressure",
-    },
-    ("ENGINE_RPM ()", "COOLANT_TEMPERATURE ()"): {
-        "type": "correlates_with",
-        "strength": "weak",
-        "description": "Higher RPM may increase coolant temperature over time",
-    },
-    ("SHORT_TERM_FUEL_TRIM_BANK_1 ()", "LONG_TERM_FUEL_TRIM_BANK_1 ()"): {
-        "type": "correlates_with",
-        "strength": "moderate",
-        "description": "Short-term and long-term fuel trim adjustments are related",
-    },
-    ("INTAKE_MANIFOLD_PRESSURE ()", "SHORT_TERM_FUEL_TRIM_BANK_1 ()"): {
-        "type": "correlates_with",
-        "strength": "moderate",
-        "description": "Intake pressure affects fuel trim calculations",
-    },
-}
-
 # ============================================================================
 # Data Structures
 # ============================================================================
@@ -167,6 +134,35 @@ class WindowStats:
 # ============================================================================
 # Helper Functions for GDN Operations
 # ============================================================================
+
+
+def require_stage2_per_sensor_thresholds(
+    per_sensor: Any,
+    sensor_names: List[str],
+    *,
+    context: str = "",
+) -> List[float]:
+    """
+    Require Stage-2 ``calibrated_thresholds['per_sensor']`` aligned with ``sensor_names``.
+
+    Raises if missing or length-mismatched. No scalar ``sensor`` fallback.
+    """
+    if per_sensor is None:
+        raise ValueError(
+            f"{context}Missing calibrated_thresholds['per_sensor'] in checkpoint. "
+            "Use a Stage-2 checkpoint with per-sensor calibration."
+        )
+    try:
+        out = [float(x) for x in per_sensor]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{context}per_sensor must be a sequence of floats, got {type(per_sensor).__name__}"
+        ) from exc
+    if len(out) != len(sensor_names):
+        raise ValueError(
+            f"{context}per_sensor length {len(out)} != len(sensor_names) {len(sensor_names)}"
+        )
+    return out
 
 
 def load_gdn_model(model_path: str, device: str = "cpu") -> Tuple[GDN, Dict[str, Any]]:
@@ -448,7 +444,6 @@ class GDNPredictor:
             "adjacency_matrix": adjacency_matrix,
             "X_windows": X_windows,
             "gdn_predictions": gdn_predictions,
-            "propagation_threshold": self.sensor_threshold,
             "per_sensor_thresholds": self.per_sensor_thresholds,
         }
 
@@ -567,10 +562,10 @@ class KnowledgeGraph:
         self,
         X_windows: np.ndarray,
         gdn_predictions: np.ndarray,
+        propagation_per_sensor_thresholds: List[float],
         X_windows_unnormalized: Optional[np.ndarray] = None,
         sensor_labels_true: Optional[np.ndarray] = None,
         window_labels_true: Optional[np.ndarray] = None,
-        propagation_threshold: Optional[float] = None,
     ) -> "KnowledgeGraph":
         """
         Main method: Build KG by traversing windows temporally.
@@ -580,6 +575,7 @@ class KnowledgeGraph:
         Args:
             X_windows: (num_windows, window_size, num_sensors) normalized sensor data windows
             gdn_predictions: (num_windows, num_sensors) GDN anomaly scores (0.0-1.0) per sensor per window
+            propagation_per_sensor_thresholds: Stage-2 calibrated τ per sensor, same order as ``sensor_names``
             X_windows_unnormalized: (num_windows, window_size, num_sensors) unnormalized windows (optional)
             sensor_labels_true: Optional (num_windows, num_sensors) ground truth labels (for thresholds only)
             window_labels_true: Optional (num_windows,) ground truth window labels (for thresholds only)
@@ -588,6 +584,12 @@ class KnowledgeGraph:
             self (for method chaining)
         """
         num_windows = len(X_windows)
+
+        self._propagation_per_sensor_thresholds = require_stage2_per_sensor_thresholds(
+            propagation_per_sensor_thresholds,
+            self.sensor_names,
+            context="KnowledgeGraph.construct: ",
+        )
 
         # Store window data
         self.X_windows = X_windows
@@ -623,9 +625,7 @@ class KnowledgeGraph:
                 window_idx, window_data, window_gdn_scores
             )
 
-        # Track anomaly propagation (use checkpoint threshold if provided)
-        thr = propagation_threshold if propagation_threshold is not None else 0.5
-        self._track_anomaly_propagation(gdn_predictions, threshold=thr)
+        self._track_anomaly_propagation(gdn_predictions)
 
         print(
             f"✓ Knowledge Graph built: {self.number_of_nodes()} nodes, {self.number_of_edges()} edges"
@@ -758,29 +758,10 @@ class KnowledgeGraph:
             "gdn_score_target": float(stats_j.anomaly_score),
         }
 
-        # Check domain knowledge
-        expected_rel = EXPECTED_CORRELATIONS.get(
-            (sensor_i, sensor_j)
-        ) or EXPECTED_CORRELATIONS.get((sensor_j, sensor_i))
-        if expected_rel:
-            edge_attrs["domain_expected_type"] = expected_rel["type"]
-            edge_attrs["domain_expected_strength"] = expected_rel["strength"]
-            # Simple violation check
-            if "increase_with" in expected_rel["type"] and window_corr < 0:
-                edge_attrs["violates_domain_expectation"] = True
-            else:
-                edge_attrs["violates_domain_expectation"] = False
-        else:
-            edge_attrs["violates_domain_expectation"] = False
-
-        # Check GDN expectation violation
         deviation = abs(window_corr - expected_corr_gdn)
         edge_attrs["violates_gdn_expectation"] = deviation > deviation_threshold
 
-        # Potential fault indicator
-        if edge_attrs.get("violates_domain_expectation", False) or edge_attrs.get(
-            "violates_gdn_expectation", False
-        ):
+        if edge_attrs.get("violates_gdn_expectation", False):
             if (
                 stats_i.anomaly_score > anomaly_threshold
                 or stats_j.anomaly_score > anomaly_threshold
@@ -805,11 +786,12 @@ class KnowledgeGraph:
         """Build temporal edges connecting consecutive windows."""
         prev_stats = self.window_stats[prev_window_idx]
         curr_stats = self.window_stats[curr_window_idx]
-        prediction_threshold = 0.5
 
         for sensor_name in self.sensor_names:
             prev_stat = prev_stats[sensor_name]
             curr_stat = curr_stats[sensor_name]
+            sidx = self.sensor_to_idx[sensor_name]
+            thr = self._propagation_per_sensor_thresholds[sidx]
 
             # Temporal continuation
             self.kg.add_edge(
@@ -835,8 +817,8 @@ class KnowledgeGraph:
                 )
 
             # Anomaly propagation
-            prev_faulty = prev_stat.anomaly_score > prediction_threshold
-            curr_faulty = curr_stat.anomaly_score > prediction_threshold
+            prev_faulty = prev_stat.anomaly_score > thr
+            curr_faulty = curr_stat.anomaly_score > thr
 
             if prev_faulty and curr_faulty:
                 self.kg.add_edge(
@@ -859,16 +841,15 @@ class KnowledgeGraph:
                     target_window=curr_window_idx,
                 )
 
-    def _track_anomaly_propagation(
-        self, gdn_predictions: np.ndarray, threshold: float = 0.5
-    ):
-        """Track how faults propagate across windows."""
+    def _track_anomaly_propagation(self, gdn_predictions: np.ndarray):
+        """Track how faults propagate across windows using Stage-2 per-sensor thresholds."""
         num_windows = len(gdn_predictions)
+        thr_vec = self._propagation_per_sensor_thresholds
         first_occurrence_all = {}
 
         for window_idx in range(num_windows):
             for sensor_idx, sensor_name in enumerate(self.sensor_names):
-                if gdn_predictions[window_idx, sensor_idx] > threshold:
+                if gdn_predictions[window_idx, sensor_idx] > thr_vec[sensor_idx]:
                     if sensor_name not in first_occurrence_all:
                         first_occurrence_all[sensor_name] = window_idx
 
@@ -886,7 +867,7 @@ class KnowledgeGraph:
             affected_first_occurrence = {}
             for window_idx in range(root_window + 1, num_windows):
                 for sensor_idx, sensor_name in enumerate(self.sensor_names):
-                    if gdn_predictions[window_idx, sensor_idx] > threshold:
+                    if gdn_predictions[window_idx, sensor_idx] > thr_vec[sensor_idx]:
                         if sensor_name in first_occurrence_all:
                             sensor_first_window = first_occurrence_all[sensor_name]
                             if (
@@ -1006,9 +987,7 @@ class KnowledgeGraph:
                         deviation_from_gdn > deviation_threshold
                     )
 
-                    if edge_attrs.get(
-                        "violates_gdn_expectation", False
-                    ) or edge_attrs.get("violates_domain_expectation", False):
+                    if edge_attrs.get("violates_gdn_expectation", False):
                         if (
                             stats_i.anomaly_score > anomaly_threshold
                             or stats_j.anomaly_score > anomaly_threshold
@@ -1017,18 +996,26 @@ class KnowledgeGraph:
                         else:
                             edge_attrs["potential_fault_indicator"] = False
 
-    def get_window_kg(
-        self, window_idx: int, temporal_context_windows: int = 2
+    def _stage2_threshold_for_sensor(
+        self, sensor_name: str, per_sensor_thresholds: List[float]
+    ) -> float:
+        """Per-sensor τ for ``sensor_name``; ``per_sensor_thresholds`` must match ``sensor_names`` order."""
+        idx = self.sensor_to_idx.get(sensor_name, -1)
+        if idx < 0 or idx >= len(per_sensor_thresholds):
+            raise ValueError(f"Unknown sensor index for {sensor_name!r}")
+        return float(per_sensor_thresholds[idx])
+
+    def _build_window_context(
+        self,
+        window_idx: int,
+        per_sensor_thresholds: List[float],
+        temporal_context_windows: int = 2,
     ) -> Dict[str, Any]:
         """
-        Retrieve KG context for a specific window (for evaluation).
+        Build KG context for one window. Used by get_window_kg and precompute_window_contexts.
 
-        Args:
-            window_idx: Index of the window
-            temporal_context_windows: Number of previous windows to include
-
-        Returns:
-            Dictionary with KG context for the window
+        Correlation violations are listed only when at least one endpoint sensor's GDN score
+        exceeds its Stage-2 per-sensor calibrated threshold (same order as ``sensor_names``).
         """
         context = {
             "entities": [],
@@ -1044,25 +1031,14 @@ class KnowledgeGraph:
 
         window_graph = self.window_graphs[window_idx]
         window_stats = self.window_stats.get(window_idx, {})
-        thresholds = self.distribution_thresholds
 
-        # Extract entities
         for sensor_name in self.sensor_names:
             desc = SENSOR_DESCRIPTIONS.get(sensor_name, {})
             subsystem = SENSOR_SUBSYSTEMS.get(sensor_name, "Unknown")
             stat = window_stats.get(sensor_name)
 
-            if thresholds:
-                anomaly_threshold_per_sensor = thresholds.get(
-                    "anomaly_threshold_per_sensor", {}
-                )
-                anomaly_threshold = anomaly_threshold_per_sensor.get(
-                    sensor_name, thresholds.get("anomaly_threshold_global", 0.5)
-                )
-            else:
-                anomaly_threshold = 0.5
-
-            is_faulty = stat.anomaly_score > anomaly_threshold if stat else False
+            thr = self._stage2_threshold_for_sensor(sensor_name, per_sensor_thresholds)
+            is_faulty = bool(stat.anomaly_score > thr) if stat else False
 
             context["entities"].append(
                 {
@@ -1074,21 +1050,18 @@ class KnowledgeGraph:
                 }
             )
 
-        # Extract relationships
-        prediction_threshold = 0.5
         anomalous_sensors = {
             sensor_name
             for sensor_name, stat in window_stats.items()
-            if stat.anomaly_score > prediction_threshold
+            if stat.anomaly_score
+            > self._stage2_threshold_for_sensor(sensor_name, per_sensor_thresholds)
         }
 
         for u, v, data in window_graph.edges(data=True):
             correlation_strength = data.get(
                 "correlation_strength", abs(data.get("correlation", 0))
             )
-            is_violation = data.get("violates_domain_expectation", False) or data.get(
-                "violates_gdn_expectation", False
-            )
+            is_violation = bool(data.get("violates_gdn_expectation", False))
             involves_anomaly = u in anomalous_sensors or v in anomalous_sensors
             is_significant = correlation_strength >= 0.3
             potential_fault = data.get("potential_fault_indicator", False)
@@ -1109,9 +1082,6 @@ class KnowledgeGraph:
                     data.get("expected_correlation_gdn", 0)
                 ),
                 "deviation_from_gdn": float(data.get("deviation_from_gdn", 0)),
-                "violates_domain_expectation": data.get(
-                    "violates_domain_expectation", False
-                ),
                 "violates_gdn_expectation": data.get("violates_gdn_expectation", False),
                 "gdn_score_source": float(data.get("gdn_score_source", 0)),
                 "gdn_score_target": float(data.get("gdn_score_target", 0)),
@@ -1119,10 +1089,11 @@ class KnowledgeGraph:
             }
 
             context["relationships"].append(relationship)
-            if is_violation:
+            if is_violation and (
+                u in anomalous_sensors or v in anomalous_sensors
+            ):
                 context["violations"].append(relationship)
 
-        # Extract temporal context
         for prev_idx in range(
             max(0, window_idx - temporal_context_windows), window_idx
         ):
@@ -1135,7 +1106,9 @@ class KnowledgeGraph:
                 }
 
                 for sensor_name, stat in prev_stats.items():
-                    if stat.anomaly_score > prediction_threshold:
+                    if stat.anomaly_score > self._stage2_threshold_for_sensor(
+                        sensor_name, per_sensor_thresholds
+                    ):
                         temporal_info["faulty_sensors"].append(sensor_name)
                         temporal_info["anomaly_scores"][sensor_name] = float(
                             stat.anomaly_score
@@ -1144,7 +1117,6 @@ class KnowledgeGraph:
                 if temporal_info["faulty_sensors"]:
                     context["temporal_context"].append(temporal_info)
 
-        # Extract anomaly propagation
         for chain in self.anomaly_propagation_chains:
             root_window = chain.get("root_window", -1)
             if root_window == window_idx:
@@ -1168,6 +1140,49 @@ class KnowledgeGraph:
                         break
 
         return context
+
+    def precompute_window_contexts(
+        self,
+        num_windows: int,
+        per_sensor_thresholds: List[float],
+        temporal_context_windows: int = 2,
+    ) -> List[Dict[str, Any]]:
+        """
+        Single-pass precomputation of per-window KG contexts for evaluation (no repeated graph walks).
+        """
+        _ = require_stage2_per_sensor_thresholds(
+            per_sensor_thresholds,
+            self.sensor_names,
+            context="KnowledgeGraph.precompute_window_contexts: ",
+        )
+        return [
+            self._build_window_context(
+                i,
+                per_sensor_thresholds,
+                temporal_context_windows=temporal_context_windows,
+            )
+            for i in range(num_windows)
+        ]
+
+    def get_window_kg(
+        self,
+        window_idx: int,
+        per_sensor_thresholds: List[float],
+        temporal_context_windows: int = 2,
+    ) -> Dict[str, Any]:
+        """
+        Retrieve KG context for a specific window (for evaluation).
+
+        Args:
+            window_idx: Index of the window
+            per_sensor_thresholds: Stage-2 per-sensor τ list aligned with sensor_names
+            temporal_context_windows: Number of previous windows to include
+        """
+        return self._build_window_context(
+            window_idx,
+            per_sensor_thresholds,
+            temporal_context_windows=temporal_context_windows,
+        )
 
     def save(self, path: str):
         """
@@ -1529,11 +1544,16 @@ def main():
     print("Step 5: Building Knowledge Graph")
     print("=" * 80)
     kg = KnowledgeGraph(sensor_names, sensor_embeddings, adjacency_matrix)
+    ps = require_stage2_per_sensor_thresholds(
+        metadata.get("per_sensor_thresholds"),
+        sensor_names,
+        context="create_kg main: ",
+    )
     kg.construct(
         X_windows=X_windows,
         gdn_predictions=gdn_predictions,
+        propagation_per_sensor_thresholds=ps,
         X_windows_unnormalized=X_windows_unnormalized,
-        propagation_threshold=metadata.get("sensor_threshold"),
     )
 
     # Save to file if requested

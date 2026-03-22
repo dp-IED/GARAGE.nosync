@@ -23,23 +23,59 @@ from tqdm import tqdm
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from llm.inference import (
-    create_client,
-    create_json_schema_response_format,
-    LMStudioClient,
-)
-
+from llm.inference import create_client, LMStudioClient
 from llm.evaluation.metrics import compute_all_metrics, format_metrics_report
-from llm.evaluation.schemas import FaultDiagnosis
-from llm.evaluation.utils import parse_structured_response, parsed_to_prediction
-
-
-SYSTEM_PROMPT = (
-    "You are an automotive fault diagnostics system. You will receive "
-    "raw OBD-II sensor time-series data from a vehicle. Identify faulty "
-    "sensors and classify the fault type. Only use sensor names from the "
-    "provided valid list. Respond with JSON only."
+from llm.evaluation.stratified_sampling import (
+    stratified_sample_indices,
+    validate_fault_types_for_stratification,
 )
+from llm.evaluation.utils import call_llm_fault_diagnosis
+from training.fault_injection import STATE_NAMES
+
+VALID_FAULT_TYPES = sorted(STATE_NAMES)
+
+# Observable signal characteristics for each fault type.
+# Descriptions are expressed as what can be seen in the raw sensor signal —
+# no injection parameters or implementation details.
+FAULT_TYPE_DESCRIPTIONS = {
+    "COOLANT_DROPOUT": "coolant temperature shows 2-5 intermittent drops well below normal operating range",
+    "MAF_SCALE_LOW": "intake manifold pressure reads consistently ~20% lower than normal throughout the window",
+    "TPS_STUCK": "throttle position freezes at a constant value from roughly the midpoint onward (near-zero variability in second half)",
+    "VSS_DROPOUT": "vehicle speed drops to near-zero for roughly the middle third of the window then recovers",
+    "gradual_drift": "RPM, engine load, or fuel trim shows a sustained spike, dropout, or gradual drift across the window",
+}
+
+SYSTEM_PROMPT = """You are an automotive OBD-II fault diagnostics system.
+
+Your task for each window of sensor data:
+1. Determine whether the window contains a fault (is_faulty).
+2. If faulty, identify which sensor(s) are the root cause (faulty_sensors).
+3. If faulty, classify the fault type (fault_type).
+
+A window is faulty if any sensor shows an abnormal pattern such as:
+- abrupt drops to near-zero or well below its normal operating range
+- freezing at a constant value (std ≈ 0 in a portion of the window)
+- a consistent scale reduction (mean significantly below normal)
+- sustained spikes, dropouts, or drifts compared to typical operation
+
+Respond with a single JSON object. No markdown, no extra prose."""
+
+JSON_INSTRUCTIONS = (
+    "Required JSON fields:\n"
+    "  - is_faulty: true if a fault is detected, false otherwise\n"
+    "  - faulty_sensors: list of sensor names (use exactly from VALID SENSOR NAMES; empty [] if no fault)\n"
+    "  - fault_type: exactly one value from VALID FAULT TYPES (use 'normal' if no fault)\n"
+    "  - confidence: 'high', 'medium', or 'low'\n"
+    "  - reasoning: brief explanation referencing the specific signal pattern observed"
+)
+
+
+def _format_fault_type_list() -> str:
+    """Format fault types with descriptions for prompt inclusion."""
+    lines = []
+    for ft, desc in FAULT_TYPE_DESCRIPTIONS.items():
+        lines.append(f"  {ft}: {desc}")
+    return "\n".join(lines)
 
 
 def build_baseline_prompt(
@@ -56,112 +92,21 @@ def build_baseline_prompt(
         series_dict[name] = [round(float(v), 3) for v in values]
 
     lines = []
-    lines.append("SENSOR TIME SERIES (300 timesteps per sensor):")
+    lines.append("SENSOR TIME SERIES (300 timesteps per sensor, unnormalized real-world values):")
     lines.append(json.dumps(series_dict))
     lines.append("")
     lines.append("VALID SENSOR NAMES (use exactly these in faulty_sensors field):")
     lines.append(", ".join(sensor_names))
+    lines.append("")
+    lines.append("VALID FAULT TYPES (use exactly one; 'normal' if no fault detected):")
+    lines.append(_format_fault_type_list())
+    lines.append("")
+    lines.append(JSON_INSTRUCTIONS)
 
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": "\n".join(lines)},
     ]
-
-
-def _call_llm_structured(
-    client: LMStudioClient,
-    model_name: str,
-    messages: List[Dict[str, str]],
-) -> str:
-    """Call LLM with structured JSON schema output."""
-    response_format = create_json_schema_response_format(
-        schema_name="FaultDiagnosis",
-        schema_dict=FaultDiagnosis.model_json_schema(),
-        strict=True
-    )
-
-    response = client.chat_completions_create(
-        model=model_name,
-        messages=messages,
-        response_format=response_format,
-        temperature=0.0,
-    )
-    return response["choices"][0]["message"]["content"]
-
-
-INVALID_FAULT_TYPE_LABELS = frozenset({"normal", "unknown", "faulty", ""})
-
-
-def _validate_fault_types_for_stratification(
-    fault_types: np.ndarray,
-    sensor_labels: np.ndarray,
-) -> None:
-    """
-    Assert fault_types exists and every faulty window has a valid fault type.
-    Raises ValueError if any faulty window lacks a proper fault type.
-    """
-    faulty_mask = sensor_labels.sum(axis=1) != 0
-    faulty_indices = np.where(faulty_mask)[0]
-    if len(faulty_indices) == 0:
-        return
-    for i in faulty_indices:
-        ft = fault_types[i]
-        ft_str = (str(ft).strip() if ft is not None else "")
-        if ft is None or ft_str in INVALID_FAULT_TYPE_LABELS:
-            raise ValueError(
-                f"Stratified limit requires valid fault_types for every faulty window. "
-                f"Window {i} has sensor_labels.sum(axis=1) != 0 but fault_types[{i}] = {ft!r} "
-                f"(None, empty, 'normal', 'unknown', or 'faulty' are invalid for faulty windows)."
-            )
-
-
-def _stratified_sample_indices(
-    fault_types: np.ndarray,
-    limit: int,
-    random_state: int = 42,
-) -> np.ndarray:
-    """
-    Sample indices stratified by fault type, preserving full-dataset proportions.
-    Returns sorted indices for deterministic ordering.
-    """
-    n = len(fault_types)
-    if limit >= n:
-        return np.arange(n)
-
-    ft_str = np.array(
-        [(str(ft).strip() or "normal") if ft is not None else "normal" for ft in fault_types]
-    )
-    unique = np.unique(ft_str)
-    stratum_indices = {ft: np.where(ft_str == ft)[0] for ft in unique}
-    stratum_sizes = {ft: len(idxs) for ft, idxs in stratum_indices.items()}
-    total = sum(stratum_sizes.values())
-
-    targets = {}
-    for ft in unique:
-        raw = limit * stratum_sizes[ft] / total
-        targets[ft] = max(0, min(stratum_sizes[ft], int(np.floor(raw))))
-
-    current_sum = sum(targets.values())
-    remainder = limit - current_sum
-    if remainder > 0:
-        fracs = [(limit * stratum_sizes[ft] / total - targets[ft], ft) for ft in unique]
-        fracs.sort(key=lambda x: -x[0])
-        for _, ft in fracs:
-            if remainder <= 0:
-                break
-            add = min(remainder, stratum_sizes[ft] - targets[ft])
-            targets[ft] += add
-            remainder -= add
-
-    rng = np.random.default_rng(random_state)
-    sampled = []
-    for ft in unique:
-        idxs = stratum_indices[ft]
-        k = min(targets[ft], len(idxs))
-        chosen = rng.choice(idxs, size=k, replace=False)
-        sampled.extend(chosen.tolist())
-
-    return np.sort(np.array(sampled))
 
 
 def filter_sensor_labels_to_root_only(parsed_result: Dict, sensor_names: List[str]) -> np.ndarray:
@@ -233,6 +178,7 @@ def evaluate_llm_baseline(
     model_repo: Optional[str] = None,
     base_url: Optional[str] = None,
     limit: Optional[int] = None,
+    stratify_limit: bool = True,
     seed: int = 42,
     timeout: int = 120,
 ) -> Dict[str, any]:
@@ -243,7 +189,8 @@ def evaluate_llm_baseline(
         dataset_path: Path to shared dataset (.npz file)
         output_path: Optional path to save results JSON
         model_repo: Model name in LM Studio
-        limit: Optional limit on number of windows to process (for testing)
+        limit: Optional cap on windows (default: stratified by fault_types when below dataset size)
+        stratify_limit: If False with --limit, use the first N windows in file order
 
     Returns:
         Dictionary with evaluation results
@@ -303,23 +250,38 @@ def evaluate_llm_baseline(
     sample_indices = None
 
     if limit is not None and limit > 0 and limit < num_windows:
-        if fault_types_full is None:
-            raise ValueError(
-                "Stratified limit requires fault_types in the dataset. "
-                "The .npz file must contain a 'fault_types' array."
+        if stratify_limit:
+            if fault_types_full is None:
+                raise ValueError(
+                    "Stratified limit requires fault_types in the dataset. "
+                    "The .npz file must contain a 'fault_types' array."
+                )
+            validate_fault_types_for_stratification(fault_types_full, sensor_labels_true)
+            sample_indices = stratified_sample_indices(
+                fault_types_full, limit, random_state=seed
             )
-        _validate_fault_types_for_stratification(fault_types_full, sensor_labels_true)
-        sample_indices = _stratified_sample_indices(
-            fault_types_full, limit, random_state=seed
-        )
-        num_windows = len(sample_indices)
-        unnormalized_windows = unnormalized_windows[sample_indices]
-        sensor_labels_true = sensor_labels_true[sample_indices]
-        window_labels_true = window_labels_true[sample_indices]
-        fault_types_full = fault_types_full[sample_indices]
-        if statistical_features is not None and len(statistical_features) == num_windows_full:
-            statistical_features = statistical_features[sample_indices]
-        print(f"  ⚠️  LIMIT MODE: Stratified sample of {num_windows} windows (seed={seed})")
+            num_windows = len(sample_indices)
+            unnormalized_windows = unnormalized_windows[sample_indices]
+            sensor_labels_true = sensor_labels_true[sample_indices]
+            window_labels_true = window_labels_true[sample_indices]
+            fault_types_full = fault_types_full[sample_indices]
+            if statistical_features is not None and len(statistical_features) == num_windows_full:
+                statistical_features = statistical_features[sample_indices]
+            print(f"  ⚠️  LIMIT MODE: Stratified sample of {num_windows} windows (seed={seed})")
+        else:
+            sample_indices = None
+            ix = np.arange(limit, dtype=np.int64)
+            num_windows = int(limit)
+            unnormalized_windows = unnormalized_windows[ix]
+            sensor_labels_true = sensor_labels_true[ix]
+            window_labels_true = window_labels_true[ix]
+            if fault_types_full is not None:
+                fault_types_full = fault_types_full[ix]
+            if statistical_features is not None and len(statistical_features) == num_windows_full:
+                statistical_features = statistical_features[ix]
+            print(
+                f"  ⚠️  LIMIT MODE: First {num_windows} windows in file order (--no-stratify-limit)"
+            )
 
     print(f"  Loaded {num_windows} windows")
     print(f"  Window size: {unnormalized_windows.shape[1]}")
@@ -332,6 +294,7 @@ def evaluate_llm_baseline(
     # Run predictions
     print("Running LLM predictions...")
     window_labels_pred = []
+    is_faulty_pred = []  # Direct LLM is_faulty boolean
     sensor_labels_pred = []  # Filtered (root-only) predictions
     sensor_labels_pred_raw = []  # Raw (all sensors) predictions
     fault_types_pred = []
@@ -347,26 +310,15 @@ def evaluate_llm_baseline(
             )
             context_length = sum(len(m.get("content", "").split()) for m in messages)
 
-            try:
-                raw_json = _call_llm_structured(client, model_name, messages)
-                parsed = parse_structured_response(raw_json, sensor_names)
-                prediction = parsed_to_prediction(parsed, sensor_names)
-            except Exception as e:
-                if window_idx == 0:
-                    print(f"  ⚠️  LLM error on first window: {e}")
-                empty_labels = np.zeros(len(sensor_names), dtype=np.float32)
-                prediction = {
-                    "window_label": 0,
-                    "sensor_labels": empty_labels,
-                    "sensor_labels_root_only": empty_labels.copy(),
-                    "fault_type": None,
-                    "reasoning": f"Error: {str(e)}",
-                }
+            prediction = call_llm_fault_diagnosis(client, model_name, messages, sensor_names)
+            if window_idx == 0 and "Error:" in prediction.get("reasoning", ""):
+                print(f"  ⚠️  LLM error on first window: {prediction['reasoning']}")
 
             sensor_labels_filtered = filter_sensor_labels_to_root_only(prediction, sensor_names)
             sensor_labels_raw = prediction.get("sensor_labels", sensor_labels_filtered.copy())
 
             window_labels_pred.append(prediction["window_label"])
+            is_faulty_pred.append(int(prediction.get("is_faulty", prediction["window_label"] > 0)))
             sensor_labels_pred.append(sensor_labels_filtered)
             sensor_labels_pred_raw.append(sensor_labels_raw)
             fault_types_pred.append(prediction["fault_type"])
@@ -385,6 +337,7 @@ def evaluate_llm_baseline(
                 pbar.set_postfix({"avg_time": f"{avg_time:.2f}s"})
 
     window_labels_pred = np.array(window_labels_pred)
+    is_faulty_pred = np.array(is_faulty_pred)  # Direct LLM is_faulty boolean (0/1)
     sensor_labels_pred = np.array(sensor_labels_pred)  # Filtered (root-only)
     sensor_labels_pred_raw = np.array(sensor_labels_pred_raw)  # Raw (all sensors)
 
@@ -420,6 +373,7 @@ def evaluate_llm_baseline(
         y_pred_sensor=sensor_labels_pred,  # Use filtered (root-only) for main metrics
         sensor_names=sensor_names,
         fault_types=fault_types_full if fault_types_full is not None else None,
+        fault_types_pred=fault_types_pred,
     )
     
     # Also compute raw metrics for comparison
@@ -452,9 +406,10 @@ def evaluate_llm_baseline(
         "num_windows": int(num_windows),
         "metrics": metrics,
         "predictions": {
+            "is_faulty": is_faulty_pred.tolist(),        # Direct LLM is_faulty boolean
             "window_labels": window_labels_pred.tolist(),
             "sensor_labels": sensor_labels_pred.tolist(),  # Filtered (root-only)
-            "sensor_labels_raw": sensor_labels_pred_raw.tolist(),  # Raw (all sensors)
+            "sensor_labels_raw": sensor_labels_pred_raw.tolist(),
             "fault_types": fault_types_pred,
             "reasoning": reasoning_list,
         },
@@ -472,7 +427,13 @@ def evaluate_llm_baseline(
     return results
 
 
-def run(dataset_path: str, lm_url: str, limit: Optional[int] = None, seed: int = 42) -> dict:
+def run(
+    dataset_path: str,
+    lm_url: str,
+    limit: Optional[int] = None,
+    stratify_limit: bool = True,
+    seed: int = 42,
+) -> dict:
     """
     Run LLM baseline evaluation and return unified format for compare_methods.
 
@@ -485,9 +446,11 @@ def run(dataset_path: str, lm_url: str, limit: Optional[int] = None, seed: int =
         output_path=None,
         base_url=lm_url,
         limit=limit,
+        stratify_limit=stratify_limit,
         seed=seed,
     )
     preds = res["predictions"]
+    n_pred = len(preds["window_labels"])
     data = np.load(dataset_path, allow_pickle=True)
     sensor_labels_true = data["sensor_labels"]
     fault_types = data.get("fault_types", None)
@@ -498,14 +461,24 @@ def run(dataset_path: str, lm_url: str, limit: Optional[int] = None, seed: int =
         sensor_labels_true = sensor_labels_true[sample_indices]
         if fault_types is not None:
             fault_types = fault_types[sample_indices]
-    ref_reason = data.get("reference_reasoning", None)
-    if ref_reason is not None:
-        ref_reason = np.asarray(ref_reason)
+    else:
+        sensor_labels_true = sensor_labels_true[:n_pred]
+        if fault_types is not None:
+            fault_types = fault_types[:n_pred]
+
+    ref_reason_raw = data.get("reference_reasoning", None)
+    if ref_reason_raw is not None:
+        ref_reason = np.asarray(ref_reason_raw)
         if sample_indices is not None:
             ref_reason = ref_reason[sample_indices]
         ref_reason = ref_reason.tolist()
     else:
-        ref_reason = [""] * len(sensor_labels_true)
+        ref_reason = [""] * n_pred
+    if len(ref_reason) < n_pred:
+        ref_reason = list(ref_reason) + [""] * (n_pred - len(ref_reason))
+    else:
+        ref_reason = ref_reason[:n_pred]
+
     sensor_names = res.get("sensor_names", [])
     if not sensor_names and "dataset_info" in res:
         sensor_names = res["dataset_info"].get("sensor_names", [])
@@ -514,13 +487,9 @@ def run(dataset_path: str, lm_url: str, limit: Optional[int] = None, seed: int =
         with open(metadata_path, "r") as f:
             meta = json.load(f)
         sensor_names = meta["dataset_info"]["sensor_names"]
-    ref_reason = data.get("reference_reasoning", None)
-    if ref_reason is not None and hasattr(ref_reason, "tolist"):
-        ref_reason = ref_reason.tolist()
-    elif ref_reason is None:
-        ref_reason = [""] * len(sensor_labels_true)
 
     results = []
+    is_faulty_list = preds.get("is_faulty", [])
     for i in range(len(preds["window_labels"])):
         wl_pred = preds["window_labels"][i]
         sl_pred = preds["sensor_labels"][i]
@@ -528,7 +497,11 @@ def run(dataset_path: str, lm_url: str, limit: Optional[int] = None, seed: int =
         reasoning = preds["reasoning"][i] if i < len(preds["reasoning"]) else ""
         sl_true = sensor_labels_true[i].tolist()
         wl_true = 1 if sum(sl_true) > 0 else 0
-        wl_pred_bin = 1 if wl_pred > 0 else 0
+        # Use the direct is_faulty boolean when available; fall back to sensor-derived
+        if i < len(is_faulty_list):
+            wl_pred_bin = int(is_faulty_list[i])
+        else:
+            wl_pred_bin = 1 if wl_pred > 0 else 0
         ft_true = fault_types[i] if fault_types is not None and i < len(fault_types) else None
         ft_true_str = "normal" if (ft_true is None or ft_true == "" or wl_true == 0) else str(ft_true)
         ft_pred_str = "normal" if (ft_pred is None or ft_pred == "") else str(ft_pred)
@@ -573,13 +546,20 @@ def main():
         "--limit",
         type=int,
         default=None,
-        help="Limit number of windows to process (stratified by fault type)",
+        help="Cap windows; default is stratified by fault type (needs fault_types in .npz unless --no-stratify-limit)",
     )
+    parser.add_argument(
+        "--no-stratify-limit",
+        action="store_false",
+        dest="stratify_limit",
+        help="With --limit, take the first N windows in file order instead of stratified sampling",
+    )
+    parser.set_defaults(stratify_limit=True)
     parser.add_argument(
         "--seed",
         type=int,
         default=42,
-        help="Random seed for stratified sampling when --limit is used (default: 42)",
+        help="Random seed for stratified --limit (default: 42)",
     )
     parser.add_argument(
         "--timeout",
@@ -595,6 +575,7 @@ def main():
         output_path=Path(args.output),
         model_repo=args.model_repo,
         limit=args.limit,
+        stratify_limit=args.stratify_limit,
         seed=args.seed,
         timeout=args.timeout,
     )

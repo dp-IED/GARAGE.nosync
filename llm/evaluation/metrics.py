@@ -45,6 +45,61 @@ def compute_fault_type_accuracy(y_true_types, y_pred_types):
     return {"accuracy": correct / len(pairs), "n": len(pairs)}
 
 
+def compute_fault_type_classification_metrics(y_true_types, y_pred_types):
+    """
+    Multi-class precision, recall, F1 for fault type classification.
+    Evaluated only on windows where ground truth is faulty (excludes 'normal' ground truth).
+    Returns overall weighted/macro metrics plus per-class breakdown.
+    """
+    from sklearn.metrics import precision_recall_fscore_support, accuracy_score
+
+    pairs = [
+        (t, p) for t, p in zip(y_true_types, y_pred_types)
+        if t not in (None, "", "normal")
+    ]
+    if not pairs:
+        return {"accuracy": 0.0, "weighted_precision": 0.0, "weighted_recall": 0.0,
+                "weighted_f1": 0.0, "macro_precision": 0.0, "macro_recall": 0.0,
+                "macro_f1": 0.0, "per_class": {}, "n": 0}
+
+    y_true = [t for t, _ in pairs]
+    y_pred = [p for _, p in pairs]
+    classes = sorted(set(y_true))
+
+    accuracy = accuracy_score(y_true, y_pred)
+    p_w, r_w, f1_w, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="weighted", zero_division=0, labels=classes
+    )
+    p_m, r_m, f1_m, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="macro", zero_division=0, labels=classes
+    )
+    p_per, r_per, f1_per, sup = precision_recall_fscore_support(
+        y_true, y_pred, average=None, zero_division=0, labels=classes
+    )
+
+    per_class = {
+        cls: {
+            "precision": float(p_per[i]),
+            "recall": float(r_per[i]),
+            "f1": float(f1_per[i]),
+            "support": int(sup[i]),
+        }
+        for i, cls in enumerate(classes)
+    }
+
+    return {
+        "accuracy": float(accuracy),
+        "weighted_precision": float(p_w),
+        "weighted_recall": float(r_w),
+        "weighted_f1": float(f1_w),
+        "macro_precision": float(p_m),
+        "macro_recall": float(r_m),
+        "macro_f1": float(f1_m),
+        "per_class": per_class,
+        "n": len(pairs),
+    }
+
+
 def compute_bertscore(references, hypotheses, lang="en"):
     """BERTScore for reasoning quality. Only on faulty windows."""
     if not references or not hypotheses:
@@ -87,6 +142,7 @@ def compute_all_metrics_unified(results, sensor_cols):
         "window": compute_window_metrics(wt, wp),
         "sensor": compute_sensor_metrics(st, sp),
         "fault_type": compute_fault_type_accuracy(ft_true, ft_pred),
+        "fault_type_classification": compute_fault_type_classification_metrics(ft_true, ft_pred),
         "bertscore": compute_bertscore(refs, hyps),
     }
 
@@ -100,6 +156,19 @@ from sklearn.metrics import (
 )
 import matplotlib.pyplot as plt
 import seaborn as sns
+
+
+def window_labels_sensor_indexed_from_sensor_binary(sensor_binary: np.ndarray) -> np.ndarray:
+    """
+    Per-window labels for compute_window_level_metrics: 0 = no fault, else 1 + index of first
+    sensor marked faulty in each row. Matches KG/LLM eval conversion from sensor_labels.
+    """
+    x = np.asarray(sensor_binary)
+    row_any = (x > 0).any(axis=1)
+    idx = np.argmax((x > 0).astype(np.int8), axis=1)
+    out = np.zeros(x.shape[0], dtype=np.int64)
+    out[row_any] = idx[row_any].astype(np.int64) + 1
+    return out
 
 
 def compute_window_level_metrics(
@@ -265,9 +334,9 @@ def compute_per_fault_type_metrics(
     Returns:
         Dictionary with metrics per fault type
     """
-    # Filter out None and empty strings before getting unique values
-    # (numpy.unique doesn't work well with None in object arrays)
-    valid_fault_types = [ft for ft in fault_types if ft is not None and ft != '']
+    # Filter out None, empty strings, and "normal" — this metric measures anomaly detection
+    # within each actual fault type's windows, so normal windows are excluded by definition.
+    valid_fault_types = [ft for ft in fault_types if ft is not None and ft != '' and ft != 'normal']
     unique_fault_types = list(set(valid_fault_types)) if valid_fault_types else []
     
     per_fault_metrics = {}
@@ -385,18 +454,20 @@ def compute_all_metrics(
     y_true_sensor: np.ndarray,
     y_pred_sensor: np.ndarray,
     sensor_names: Optional[List[str]] = None,
-    fault_types: Optional[np.ndarray] = None
+    fault_types: Optional[np.ndarray] = None,
+    fault_types_pred: Optional[List[str]] = None,
 ) -> Dict[str, any]:
     """
     Compute all evaluation metrics.
     
     Args:
-        y_true_window: (N,) binary array - true window labels
-        y_pred_window: (N,) binary array - predicted window labels
+        y_true_window: (N,) sensor-indexed true labels (0 = no fault, 1..D = first faulty sensor)
+        y_pred_window: (N,) same scheme for predictions
         y_true_sensor: (N, num_sensors) binary array - true sensor labels
         y_pred_sensor: (N, num_sensors) binary array - predicted sensor labels
         sensor_names: Optional list of sensor names
-        fault_types: Optional (N,) array of fault type strings
+        fault_types: Optional (N,) array of ground-truth fault type strings
+        fault_types_pred: Optional list of predicted fault type strings (same length as fault_types)
         
     Returns:
         Dictionary with all metrics
@@ -418,15 +489,26 @@ def compute_all_metrics(
         y_true_sensor, y_pred_sensor, y_true_window, y_pred_window, sensor_names
     )
     
-    # Per-fault-type metrics
+    # Per-fault-type detection metrics (measures anomaly detection within each fault type's windows)
     if fault_types is not None and len(fault_types) > 0:
         try:
             metrics['per_fault_type'] = compute_per_fault_type_metrics(
                 y_true_sensor, y_pred_sensor, fault_types, sensor_names
             )
         except Exception as e:
-            # If fault type metrics fail, continue without them
-            pass
+            import warnings
+            warnings.warn(f"per_fault_type metrics computation failed and will be absent from results: {e}")
+
+    # Fault type classification metrics (measures fault type string prediction accuracy)
+    if fault_types is not None and fault_types_pred is not None:
+        try:
+            ft_true_list = [str(ft) if ft is not None else "normal" for ft in fault_types]
+            metrics['fault_type_classification'] = compute_fault_type_classification_metrics(
+                ft_true_list, list(fault_types_pred)
+            )
+        except Exception as e:
+            import warnings
+            warnings.warn(f"fault_type_classification metrics computation failed and will be absent from results: {e}")
     
     return metrics
 
