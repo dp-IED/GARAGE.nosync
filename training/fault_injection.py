@@ -13,10 +13,10 @@ sensor_to_fault_type = {
     "INTAKE_MANIFOLD_PRESSURE ()": "MAF_SCALE_LOW",
     "COOLANT_TEMPERATURE ()": "COOLANT_DROPOUT",
     "THROTTLE ()": "TPS_STUCK",
-    "ENGINE_RPM ()": "gradual_drift",
-    "ENGINE_LOAD ()": "gradual_drift",
-    "SHORT_TERM_FUEL_TRIM_BANK_1 ()": "gradual_drift",
-    "LONG_TERM_FUEL_TRIM_BANK_1 ()": "gradual_drift",
+    "ENGINE_RPM ()": "RPM_SPIKE_DROPOUT",
+    "ENGINE_LOAD ()": "LOAD_SCALE_LOW",
+    "SHORT_TERM_FUEL_TRIM_BANK_1 ()": "STFT_STUCK_HIGH",
+    "LONG_TERM_FUEL_TRIM_BANK_1 ()": "LTFT_DRIFT_HIGH",
 }
 
 STATE_NAMES = set(sensor_to_fault_type.values()).union({"normal"})
@@ -189,7 +189,7 @@ def inject_faults_with_sensor_labels(
                 X_faulty[fault_idx] = torch.tensor(win, dtype=torch.float32)
                 window_labels[fault_idx] = 1
                 # Set fault type based on the primary sensor that was faulted
-                fault_types[fault_idx] = sensor_to_fault_type.get(sensor_name, "gradual_drift")
+                fault_types[fault_idx] = sensor_to_fault_type[sensor_name]
                 for sensor_i in affected_sensors:
                     sensor_labels[fault_idx, sensor_i] = 1.0
 

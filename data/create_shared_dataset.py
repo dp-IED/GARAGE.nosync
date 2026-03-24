@@ -109,7 +109,10 @@ def _generate_reference_reasoning(
         "VSS_DROPOUT": f"Vehicle speed sensor signal lost, causing correlation errors with {affected_str}.",
         "MAF_SCALE_LOW": f"Mass airflow sensor reading skewed low, impacting combustion metrics like {affected_str}.",
         "TPS_STUCK": f"Throttle position sensor is flatlined or stuck, mismatching expected load on {affected_str}.",
-        "gradual_drift": f"Gradual sensor drift detected on {affected_str} over time.",
+        "RPM_SPIKE_DROPOUT": f"Engine RPM showed a sharp spike or dropout in {affected_str}, indicating a transient fault.",
+        "LOAD_SCALE_LOW": f"Engine load reading uniformly depressed on {affected_str}, consistent with a scale fault.",
+        "STFT_STUCK_HIGH": f"Short-term fuel trim frozen at elevated value on {affected_str}, indicating a stuck sensor.",
+        "LTFT_DRIFT_HIGH": f"Long-term fuel trim drifted persistently high on {affected_str}, indicating adaptive correction fault.",
     }
     return templates.get(fault_type, f"Anomalous behavior detected in {affected_str}.")
 
