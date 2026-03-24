@@ -150,10 +150,18 @@ def parsed_to_prediction(parsed: Dict, sensor_names: List[str]) -> Dict:
     # Use the LLM's direct is_faulty verdict for the binary window label.
     # Fall back to sensor-derived label when is_faulty is not present (e.g. legacy callers).
     is_faulty: bool = parsed.get("is_faulty", sensor_labels_to_window_label(sensor_labels) > 0)
+
+    # Coerce inconsistency: if the LLM claimed fault but named no recognised sensors,
+    # treat the window as normal so that window_label and is_faulty stay in agreement.
+    if is_faulty and sensor_labels.sum() == 0:
+        is_faulty = False
+
     window_label = sensor_labels_to_window_label(sensor_labels) if is_faulty else 0
 
     # fault_type is always a non-None string: "normal", a valid fault type, or "unknown".
     fault_type: str = parsed.get("fault_type") or ("normal" if not is_faulty else "unknown")
+    if not is_faulty:
+        fault_type = "normal"
 
     return {
         "is_faulty": is_faulty,

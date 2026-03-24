@@ -24,7 +24,7 @@ from tqdm import tqdm
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from llm.inference import create_client, LMStudioClient
+from llm.inference import create_client
 
 from kg.create_kg import KnowledgeGraph, require_stage2_per_sensor_thresholds
 from kg.create_kg import GDNPredictor
@@ -35,7 +35,17 @@ from llm.evaluation.stratified_sampling import (
 )
 from llm.evaluation.utils import call_llm_fault_diagnosis
 from llm.evaluation.evaluate_llm_baseline import FAULT_TYPE_DESCRIPTIONS
-from training.fault_injection import STATE_NAMES as _VALID_FAULT_TYPES
+
+DEFAULT_SENSOR_NAMES = [
+    "ENGINE_RPM ()",
+    "VEHICLE_SPEED ()",
+    "THROTTLE ()",
+    "ENGINE_LOAD ()",
+    "COOLANT_TEMPERATURE ()",
+    "INTAKE_MANIFOLD_PRESSURE ()",
+    "SHORT_TERM_FUEL_TRIM_BANK_1 ()",
+    "LONG_TERM_FUEL_TRIM_BANK_1 ()",
+]
 
 SYSTEM_PROMPT = """You are an automotive OBD-II fault diagnostics assistant working alongside a pre-trained GDN anomaly detection model.
 
@@ -315,16 +325,7 @@ def run_kg_sanity_check(
             metadata = json.load(f)
         sensor_names = metadata["dataset_info"]["sensor_names"]
     else:
-        sensor_names = [
-            "ENGINE_RPM ()",
-            "VEHICLE_SPEED ()",
-            "THROTTLE ()",
-            "ENGINE_LOAD ()",
-            "COOLANT_TEMPERATURE ()",
-            "INTAKE_MANIFOLD_PRESSURE ()",
-            "SHORT_TERM_FUEL_TRIM_BANK_1 ()",
-            "LONG_TERM_FUEL_TRIM_BANK_1 ()",
-        ]
+        sensor_names = list(DEFAULT_SENSOR_NAMES)
 
     num_windows = normalized_windows.shape[0]
     num_sensors = len(sensor_names)
@@ -335,8 +336,6 @@ def run_kg_sanity_check(
     print()
 
     try:
-        import torch
-
         checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
         calibrated = checkpoint.get("calibrated_thresholds") or {}
         per_sensor_thr_list = require_stage2_per_sensor_thresholds(
@@ -344,7 +343,6 @@ def run_kg_sanity_check(
             sensor_names,
             context="run_kg_sanity_check: ",
         )
-        embed_dim = 32
         detected_embed_dim = 32
         if "sensor_embeddings" in checkpoint:
             detected_embed_dim = checkpoint["sensor_embeddings"].shape[1]
@@ -498,16 +496,7 @@ def evaluate_gdn_only(
             metadata = json.load(f)
         sensor_names = metadata["dataset_info"]["sensor_names"]
     else:
-        sensor_names = [
-            "ENGINE_RPM ()",
-            "VEHICLE_SPEED ()",
-            "THROTTLE ()",
-            "ENGINE_LOAD ()",
-            "COOLANT_TEMPERATURE ()",
-            "INTAKE_MANIFOLD_PRESSURE ()",
-            "SHORT_TERM_FUEL_TRIM_BANK_1 ()",
-            "LONG_TERM_FUEL_TRIM_BANK_1 ()",
-        ]
+        sensor_names = list(DEFAULT_SENSOR_NAMES)
 
     full_num_windows = int(normalized_windows.shape[0])
     fault_types_arr = data.get("fault_types", None)
@@ -654,8 +643,6 @@ def evaluate_gdn_kg_llm(
     limit: Optional[int] = None,
     stratify_limit: bool = True,
     stratified_limit_seed: int = 42,
-    use_embeddings: bool = True,
-    use_adjacency_matrix: bool = False,  # Use compact adjacency matrix format instead of verbose text
     llm_timeout: int = 120,
     max_violations_in_prompt: Optional[int] = None,
     debug_prompt: bool = False,
@@ -720,6 +707,7 @@ def evaluate_gdn_kg_llm(
     unnormalized_windows = data["unnormalized_windows"]
     sensor_labels_true = data["sensor_labels"]
     window_labels_true = data["window_labels"]
+    ref_reasoning_full = data["reference_reasoning"].tolist() if "reference_reasoning" in data else None
 
     # Load metadata
     metadata_path = dataset_path.parent / f"{dataset_path.stem}_metadata.json"
@@ -727,19 +715,8 @@ def evaluate_gdn_kg_llm(
         with open(metadata_path, "r") as f:
             metadata = json.load(f)
         sensor_names = metadata["dataset_info"]["sensor_names"]
-        statistical_features = data.get("statistical_features", None)
     else:
-        sensor_names = [
-            "ENGINE_RPM ()",
-            "VEHICLE_SPEED ()",
-            "THROTTLE ()",
-            "ENGINE_LOAD ()",
-            "COOLANT_TEMPERATURE ()",
-            "INTAKE_MANIFOLD_PRESSURE ()",
-            "SHORT_TERM_FUEL_TRIM_BANK_1 ()",
-            "LONG_TERM_FUEL_TRIM_BANK_1 ()",
-        ]
-        statistical_features = None
+        sensor_names = list(DEFAULT_SENSOR_NAMES)
 
     full_num_windows = int(normalized_windows.shape[0])
     fault_types_for_metrics = data.get("fault_types", None)
@@ -765,8 +742,8 @@ def evaluate_gdn_kg_llm(
                 sensor_labels_true = sensor_labels_true[ix]
                 window_labels_true = window_labels_true[ix]
                 fault_types_for_metrics = fault_types_for_metrics[ix]
-                if statistical_features is not None:
-                    statistical_features = statistical_features[ix]
+                if ref_reasoning_full is not None:
+                    ref_reasoning_full = [ref_reasoning_full[int(j)] for j in ix]
                 num_windows = int(len(ix))
                 print(
                     f"  ⚠️  LIMIT MODE: stratified sample of {num_windows} windows "
@@ -780,8 +757,8 @@ def evaluate_gdn_kg_llm(
                 window_labels_true = window_labels_true[ix]
                 if fault_types_for_metrics is not None:
                     fault_types_for_metrics = fault_types_for_metrics[ix]
-                if statistical_features is not None:
-                    statistical_features = statistical_features[ix]
+                if ref_reasoning_full is not None:
+                    ref_reasoning_full = ref_reasoning_full[:limit]
                 sample_indices_for_results = None
                 num_windows = int(limit)
                 print(
@@ -818,8 +795,10 @@ def evaluate_gdn_kg_llm(
             }
             for i, name in enumerate(sensor_names)
         }
-    print(f"  Normal population baseline computed from {normal_mask_pop.sum()} windows"
-          + (" (subsample)" if sample_indices is not None else ""))
+    print(
+        f"  Normal population baseline computed from {normal_mask_pop.sum()} windows"
+        + (" (subsample)" if num_windows < full_num_windows else "")
+    )
 
     # Load checkpoint and detect parameters (prefer stage2 calibrated thresholds)
     checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
@@ -850,9 +829,12 @@ def evaluate_gdn_kg_llm(
 
     # Run GDN inference for KG context (process_for_kg returns full KG inputs)
     print("Running GDN inference for KG context...")
+    _gdn_start = time.time()
     kg_preds = predictor.process_for_kg(normalized_windows, batch_size=batch_size)
+    gdn_time = time.time() - _gdn_start
 
     # Build knowledge graph
+    _kg_start = time.time()
     kg = KnowledgeGraph(
         sensor_names=sensor_names,
         sensor_embeddings=kg_preds["sensor_embeddings"],
@@ -867,6 +849,7 @@ def evaluate_gdn_kg_llm(
         sensor_labels_true=sensor_labels_true,
         window_labels_true=window_labels_true,
     )
+    kg_build_time = time.time() - _kg_start
 
     n_nodes = kg.kg.number_of_nodes()
     n_edges = kg.kg.number_of_edges()
@@ -883,11 +866,13 @@ def evaluate_gdn_kg_llm(
         print("Warning: KG context may be trivial (few or no propagation chains).")
 
     print("Precomputing per-window KG contexts (single pass, per-sensor Stage-2 τ gated violations)...")
+    _precompute_start = time.time()
     precomputed_kg_contexts = kg.precompute_window_contexts(
         num_windows,
         per_sensor_thr_list,
         temporal_context_windows=2,
     )
+    kg_precompute_time = time.time() - _precompute_start
 
     # Per-faulty-window diagnostic: violations and anomaly_propagation
     faulty_mask = (sensor_labels_true.sum(axis=1) > 0)
@@ -1014,11 +999,18 @@ def evaluate_gdn_kg_llm(
             window_labels_true_converted[i] = 0
     window_labels_true = window_labels_true_converted
 
+    # Build aligned reference reasoning list (same length as predictions)
+    n_pred = len(reasoning_list)
+    if ref_reasoning_full is not None:
+        ref_reasoning_list = list(ref_reasoning_full[:n_pred])
+        ref_reasoning_list += [""] * max(0, n_pred - len(ref_reasoning_list))
+    else:
+        ref_reasoning_list = [""] * n_pred
+
     # Compute metrics
     print("Computing evaluation metrics...")
     fault_types_true = fault_types_for_metrics
-    gdn_time = 0.0
-    kg_time = 0.0
+    kg_time = kg_build_time + kg_precompute_time
 
     metrics = compute_all_metrics(
         y_true_window=window_labels_true,
@@ -1028,6 +1020,8 @@ def evaluate_gdn_kg_llm(
         sensor_names=sensor_names,
         fault_types=fault_types_true if fault_types_true is not None else None,
         fault_types_pred=fault_types_pred,
+        reasoning=reasoning_list,
+        reference_reasoning=ref_reasoning_list,
     )
     metrics_raw = compute_all_metrics(
         y_true_window=window_labels_true,
@@ -1040,7 +1034,8 @@ def evaluate_gdn_kg_llm(
     metrics["sensor_level_raw"] = metrics_raw["sensor_level"]
     metrics["efficiency"] = {
         "gdn_processing_time_seconds": float(gdn_time),
-        "kg_build_time_seconds": float(kg_time),
+        "kg_build_time_seconds": float(kg_build_time),
+        "kg_precompute_contexts_time_seconds": float(kg_precompute_time),
         "llm_processing_time_seconds": float(llm_time),
         "total_processing_time_seconds": float(gdn_time + kg_time + llm_time),
         "windows_per_second": float(num_windows / (gdn_time + kg_time + llm_time + 1e-8)),
@@ -1120,11 +1115,12 @@ def run(
     metadata_path = (
         Path(dataset_path).parent / f"{Path(dataset_path).stem}_metadata.json"
     )
-    sensor_names = []
     if metadata_path.exists():
         with open(metadata_path, "r") as f:
             meta = json.load(f)
         sensor_names = meta["dataset_info"]["sensor_names"]
+    else:
+        sensor_names = list(DEFAULT_SENSOR_NAMES)
     ref_reason = data.get("reference_reasoning", None)
     if ref_reason is not None and hasattr(ref_reason, "tolist"):
         ref_reason = ref_reason.tolist()
@@ -1144,19 +1140,15 @@ def run(
         ref_reason = ref_reason[:n_pred]
 
     results = []
-    is_faulty_list = preds.get("is_faulty", [])
     for i in range(len(preds["window_labels"])):
-        wl_pred = preds["window_labels"][i]
         sl_pred = preds["sensor_labels"][i]
         ft_pred = preds["fault_types"][i]
         reasoning = preds["reasoning"][i] if i < len(preds["reasoning"]) else ""
         sl_true = sensor_labels_true[i].tolist()
         wl_true = 1 if sum(sl_true) > 0 else 0
-        # Use the direct is_faulty boolean when available; fall back to sensor-derived
-        if i < len(is_faulty_list):
-            wl_pred_bin = int(is_faulty_list[i])
-        else:
-            wl_pred_bin = 1 if wl_pred > 0 else 0
+        # Unified binary window prediction derived from sensor-indexed window_label (0=normal)
+        # to stay consistent with the sensor-indexed window_label stored in results/*.json.
+        wl_pred_bin = 1 if int(preds["window_labels"][i]) > 0 else 0
         ft_true = (
             fault_types[i] if fault_types is not None and i < len(fault_types) else None
         )
@@ -1252,24 +1244,6 @@ def main():
         help="Random seed when using stratified --limit (default: 42)",
     )
     parser.add_argument(
-        "--use-embeddings",
-        action="store_true",
-        default=True,
-        help="Enable embedding extraction and similarity computation (default: True)",
-    )
-    parser.add_argument(
-        "--no-embeddings",
-        dest="use_embeddings",
-        action="store_false",
-        help="Disable embedding extraction",
-    )
-    parser.add_argument(
-        "--use-adjacency-matrix",
-        action="store_true",
-        default=False,
-        help="Use compact adjacency matrix format instead of verbose text format for KG representation",
-    )
-    parser.add_argument(
         "--sanity-check",
         action="store_true",
         help="Run KG sanity check only (verify violations/propagation non-trivial, then exit)",
@@ -1341,8 +1315,6 @@ def main():
         limit=args.limit,
         stratify_limit=args.stratify_limit,
         stratified_limit_seed=args.stratified_limit_seed,
-        use_embeddings=args.use_embeddings,
-        use_adjacency_matrix=args.use_adjacency_matrix,
         llm_timeout=args.timeout,
         max_violations_in_prompt=args.max_violations_in_prompt,
         debug_prompt=args.debug_prompt,

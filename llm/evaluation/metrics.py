@@ -2,11 +2,17 @@
 Evaluation metrics for comparing diagnostic methods.
 
 Provides metrics for:
-- Window-level accuracy
-- Sensor-level precision/recall/F1
-- Per-fault-type metrics
+- Window-level binary fault detection (compute_window_metrics / unified "window" key):
+    binary {0=normal, 1=faulty} — agrees with window_label_pred derived from sensor-indexed
+    window_label (item 1 in this taxonomy).
+- Sensor-indexed multiclass localization (compute_window_level_metrics / "window_sensor_class" key):
+    0=no fault, 1..D=first faulty sensor 1-indexed — same scheme as legacy results/*.json.
+- Sensor-level multilabel precision/recall/F1 (compute_sensor_level_metrics):
+    flattened micro metrics over all (window × sensor) binary cells.
+- Per-fault-type stratified metrics
 - Confusion matrices
-- BERTScore for reasoning quality (unified pipeline)
+- BERTScore for reasoning quality (unified pipeline):
+    precision/recall/f1 are semantic similarity scores, not classifier metrics.
 """
 
 import numpy as np
@@ -26,7 +32,10 @@ def compute_window_metrics(y_true, y_pred):
 
 
 def compute_sensor_metrics(y_true, y_pred):
-    """Sensor-level precision, recall, F1 (flattened binary)."""
+    """
+    Sensor-level precision, recall, F1 (micro over all window × sensor binary cells).
+    Flattens the (N, D) arrays before computing binary P/R/F1.
+    """
     from sklearn.metrics import precision_recall_fscore_support
 
     p, r, f1, _ = precision_recall_fscore_support(
@@ -101,7 +110,13 @@ def compute_fault_type_classification_metrics(y_true_types, y_pred_types):
 
 
 def compute_bertscore(references, hypotheses, lang="en"):
-    """BERTScore for reasoning quality. Only on faulty windows."""
+    """
+    BERTScore for reasoning quality (faulty windows only).
+
+    Returns precision/recall/f1 as semantic similarity scores in [0, 1],
+    not as classifier precision/recall. Higher = generated reasoning is more
+    semantically similar to the reference explanation.
+    """
     if not references or not hypotheses:
         return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
     try:
@@ -119,32 +134,50 @@ def compute_bertscore(references, hypotheses, lang="en"):
 
 def compute_all_metrics_unified(results, sensor_cols):
     """
-    Compute all metrics from per-window results (unified format for compare_methods).
+    Thin wrapper around compute_all_metrics for the compare_methods format.
 
     results: list of dicts, one per window:
       window_label_true, window_label_pred (0=normal, 1=faulty)
-      sensor_labels_true, sensor_labels_pred (list[int] length D)
+      sensor_labels_true, sensor_labels_pred (list[float] length D)
       fault_type_true, fault_type_pred (str)
       reasoning (str), reference_reasoning (str)
+
+    Returned keys mirror compute_all_metrics: window_level, sensor_level,
+    confusion_matrices, per_fault_type, fault_type_classification, bertscore.
+    Additionally adds "window" (binary) and "sensor" (micro) keys for
+    backwards-compatibility with compare_methods callers.
     """
-    wt = np.array([r["window_label_true"] for r in results])
-    wp = np.array([r["window_label_pred"] for r in results])
+    wt_bin = np.array([r["window_label_true"] for r in results])
+    wp_bin = np.array([r["window_label_pred"] for r in results])
     st = np.array([r["sensor_labels_true"] for r in results])
     sp = np.array([r["sensor_labels_pred"] for r in results])
-    ft_true = [r.get("fault_type_true") or "normal" for r in results]
+    ft_true = np.array([r.get("fault_type_true") or "normal" for r in results])
     ft_pred = [r.get("fault_type_pred") or "normal" for r in results]
+    reasoning = [r.get("reasoning") or "" for r in results]
+    ref_reasoning = [r.get("reference_reasoning") or "" for r in results]
 
-    faulty_idx = [i for i, r in enumerate(results) if r["window_label_true"] == 1]
-    refs = [results[i].get("reference_reasoning") or "" for i in faulty_idx]
-    hyps = [results[i].get("reasoning") or "" for i in faulty_idx]
+    # Derive sensor-indexed class labels (0=no fault, 1..D=first faulty sensor)
+    y_true_window_class = window_labels_sensor_indexed_from_sensor_binary(st)
+    y_pred_window_class = window_labels_sensor_indexed_from_sensor_binary(
+        (sp > 0.5).astype(np.float32)
+    )
 
-    return {
-        "window": compute_window_metrics(wt, wp),
-        "sensor": compute_sensor_metrics(st, sp),
-        "fault_type": compute_fault_type_accuracy(ft_true, ft_pred),
-        "fault_type_classification": compute_fault_type_classification_metrics(ft_true, ft_pred),
-        "bertscore": compute_bertscore(refs, hyps),
-    }
+    metrics = compute_all_metrics(
+        y_true_window=y_true_window_class,
+        y_pred_window=y_pred_window_class,
+        y_true_sensor=st,
+        y_pred_sensor=(sp > 0.5).astype(np.float32),
+        sensor_names=sensor_cols,
+        fault_types=ft_true,
+        fault_types_pred=ft_pred,
+        reasoning=reasoning,
+        reference_reasoning=ref_reasoning,
+        window_is_faulty_true=wt_bin,
+    )
+    # Add binary window and micro sensor shims for backwards-compatibility
+    metrics["window"] = compute_window_metrics(wt_bin, wp_bin)
+    metrics["sensor"] = compute_sensor_metrics(st, sp)
+    return metrics
 
 
 # --- Legacy metrics (for existing evaluators) ---
@@ -262,12 +295,16 @@ def compute_sensor_level_metrics(
 ) -> Dict[str, any]:
     """
     Compute sensor-level metrics (multi-label classification).
-    
+
+    Overall metrics (sensor_precision/recall/f1) are **micro** averages: computed by
+    flattening the (N, D) arrays into a single binary vector and treating every
+    (window, sensor) cell as an independent prediction. Per-sensor metrics are per-column.
+
     Args:
         y_true: (N, num_sensors) binary array - true sensor labels
         y_pred: (N, num_sensors) binary array - predicted sensor labels
         sensor_names: Optional list of sensor names for per-sensor metrics
-        
+
     Returns:
         Dictionary with overall and per-sensor metrics
     """
@@ -316,56 +353,72 @@ def compute_sensor_level_metrics(
     return metrics
 
 
+def _normalize_fault_type_label(value: Any) -> str:
+    """Strip and stringify fault-type labels for comparison (empty/None -> 'normal')."""
+    if value is None:
+        return "normal"
+    s = str(value).strip()
+    return s if s else "normal"
+
+
 def compute_per_fault_type_metrics(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     fault_types: np.ndarray,
-    sensor_names: Optional[List[str]] = None
+    sensor_names: Optional[List[str]] = None,
+    fault_types_pred: Optional[List[str]] = None,
 ) -> Dict[str, Dict]:
     """
-    Compute metrics per fault type.
-    
+    Metrics stratified by ground-truth fault type (faulty windows only).
+
+    For each true fault type T, reports:
+    - fault_type_match_accuracy: among windows whose ground truth is T, fraction where
+      the predicted fault_type string equals T (same notion as per-class recall for T
+      when evaluating only faulty windows).
+    - Sensor-level metrics on the same subset (multi-label over sensors).
+
     Args:
         y_true: (N, num_sensors) binary array - true sensor labels
         y_pred: (N, num_sensors) binary array - predicted sensor labels
         fault_types: (N,) array of fault type strings
         sensor_names: Optional list of sensor names
-        
-    Returns:
-        Dictionary with metrics per fault type
+        fault_types_pred: Optional length-N predicted fault type strings; required for
+            fault_type_match_accuracy (omit keys if None).
     """
-    # Filter out None, empty strings, and "normal" — this metric measures anomaly detection
-    # within each actual fault type's windows, so normal windows are excluded by definition.
     valid_fault_types = [ft for ft in fault_types if ft is not None and ft != '' and ft != 'normal']
     unique_fault_types = list(set(valid_fault_types)) if valid_fault_types else []
-    
-    per_fault_metrics = {}
-    
+
+    per_fault_metrics: Dict[str, Dict[str, Any]] = {}
+
     for fault_type in unique_fault_types:
-        # Find windows with this fault type
         mask = fault_types == fault_type
-        if mask.sum() == 0:
+        n_win = int(mask.sum())
+        if n_win == 0:
             continue
-        
+
         fault_y_true = y_true[mask]
         fault_y_pred = y_pred[mask]
-        
-        # Window-level metrics for this fault type
-        window_true = (fault_y_true.sum(axis=1) > 0).astype(int)
-        window_pred = (fault_y_pred.sum(axis=1) > 0).astype(int)
-        
-        per_fault_metrics[fault_type] = {
-            'num_windows': int(mask.sum()),
-            'window_accuracy': float(accuracy_score(window_true, window_pred)),
-            'window_precision': float(precision_score(window_true, window_pred, zero_division=0)),
-            'window_recall': float(recall_score(window_true, window_pred, zero_division=0)),
-            'window_f1': float(f1_score(window_true, window_pred, zero_division=0)),
+
+        true_label_norm = _normalize_fault_type_label(fault_type)
+        entry: Dict[str, Any] = {
+            'num_windows': n_win,
             'sensor_accuracy': float(accuracy_score(fault_y_true.flatten(), fault_y_pred.flatten())),
             'sensor_precision': float(precision_score(fault_y_true.flatten(), fault_y_pred.flatten(), zero_division=0)),
             'sensor_recall': float(recall_score(fault_y_true.flatten(), fault_y_pred.flatten(), zero_division=0)),
-            'sensor_f1': float(f1_score(fault_y_true.flatten(), fault_y_pred.flatten(), zero_division=0))
+            'sensor_f1': float(f1_score(fault_y_true.flatten(), fault_y_pred.flatten(), zero_division=0)),
         }
-    
+
+        if fault_types_pred is not None and len(fault_types_pred) == len(fault_types):
+            idx = np.where(mask)[0]
+            correct = 0
+            for i in idx:
+                if _normalize_fault_type_label(fault_types_pred[int(i)]) == true_label_norm:
+                    correct += 1
+            entry['fault_type_match_accuracy'] = float(correct / n_win) if n_win else 0.0
+            entry['fault_type_correct'] = int(correct)
+
+        per_fault_metrics[fault_type] = entry
+
     return per_fault_metrics
 
 
@@ -456,10 +509,13 @@ def compute_all_metrics(
     sensor_names: Optional[List[str]] = None,
     fault_types: Optional[np.ndarray] = None,
     fault_types_pred: Optional[List[str]] = None,
-) -> Dict[str, any]:
+    reasoning: Optional[List[str]] = None,
+    reference_reasoning: Optional[List[str]] = None,
+    window_is_faulty_true: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
     """
     Compute all evaluation metrics.
-    
+
     Args:
         y_true_window: (N,) sensor-indexed true labels (0 = no fault, 1..D = first faulty sensor)
         y_pred_window: (N,) same scheme for predictions
@@ -468,32 +524,44 @@ def compute_all_metrics(
         sensor_names: Optional list of sensor names
         fault_types: Optional (N,) array of ground-truth fault type strings
         fault_types_pred: Optional list of predicted fault type strings (same length as fault_types)
-        
+        reasoning: Optional (N,) list of model-generated reasoning strings
+        reference_reasoning: Optional (N,) list of ground-truth reasoning strings
+        window_is_faulty_true: Optional (N,) binary array marking truly faulty windows.
+            If None, derived from y_true_window > 0. Used to restrict BERTScore to
+            faulty windows only.
+
     Returns:
-        Dictionary with all metrics
+        Dictionary with all metrics. Includes 'bertscore' when reasoning and
+        reference_reasoning are both provided.
     """
     metrics = {}
-    
+
     # Window-level metrics (multi-class: 0-8)
     metrics['window_level'] = compute_window_level_metrics(
         y_true_window, y_pred_window, sensor_names
     )
-    
+
     # Sensor-level metrics
     metrics['sensor_level'] = compute_sensor_level_metrics(
         y_true_sensor, y_pred_sensor, sensor_names
     )
-    
+
     # Confusion matrices
     metrics['confusion_matrices'] = compute_confusion_matrices(
         y_true_sensor, y_pred_sensor, y_true_window, y_pred_window, sensor_names
     )
-    
-    # Per-fault-type detection metrics (measures anomaly detection within each fault type's windows)
+
+    # Per-fault-type: fault-type classification rate per stratum + sensor localization on that stratum
     if fault_types is not None and len(fault_types) > 0:
         try:
             metrics['per_fault_type'] = compute_per_fault_type_metrics(
-                y_true_sensor, y_pred_sensor, fault_types, sensor_names
+                y_true_sensor,
+                y_pred_sensor,
+                fault_types,
+                sensor_names,
+                fault_types_pred=list(fault_types_pred)
+                if fault_types_pred is not None
+                else None,
             )
         except Exception as e:
             import warnings
@@ -509,7 +577,22 @@ def compute_all_metrics(
         except Exception as e:
             import warnings
             warnings.warn(f"fault_type_classification metrics computation failed and will be absent from results: {e}")
-    
+
+    # BERTScore: semantic similarity between generated and reference reasoning (faulty windows only)
+    if reasoning is not None and reference_reasoning is not None:
+        try:
+            faulty_mask = (
+                window_is_faulty_true > 0
+                if window_is_faulty_true is not None
+                else y_true_window > 0
+            )
+            refs = [reference_reasoning[i] or "" for i in range(len(faulty_mask)) if faulty_mask[i]]
+            hyps = [reasoning[i] or "" for i in range(len(faulty_mask)) if faulty_mask[i]]
+            metrics['bertscore'] = compute_bertscore(refs, hyps)
+        except Exception as e:
+            import warnings
+            warnings.warn(f"BERTScore computation failed and will be absent from results: {e}")
+
     return metrics
 
 
@@ -581,14 +664,29 @@ def format_metrics_report(metrics: Dict[str, any]) -> str:
                            f"TN: {sensor_metrics['true_negatives']}")
             lines.append("")
     
-    # Per-fault-type metrics
+    # Fault-type classification (faulty windows only; see compute_fault_type_classification_metrics)
+    if 'fault_type_classification' in metrics:
+        ftc = metrics['fault_type_classification']
+        lines.append("Fault-Type Classification (ground-truth faulty windows only):")
+        lines.append("-" * 40)
+        lines.append(f"  Accuracy:        {ftc.get('accuracy', 0):.4f}")
+        lines.append(f"  Weighted F1:     {ftc.get('weighted_f1', 0):.4f}")
+        lines.append(f"  Macro F1:        {ftc.get('macro_f1', 0):.4f}")
+        lines.append(f"  n (faulty only): {ftc.get('n', 0)}")
+        lines.append("")
+
+    # Per-fault-type metrics (stratified by true fault type)
     if 'per_fault_type' in metrics:
-        lines.append("Per-Fault-Type Metrics:")
+        lines.append("Per-Fault-Type Metrics (stratified by ground-truth fault type):")
         lines.append("-" * 40)
         for fault_type, ft_metrics in metrics['per_fault_type'].items():
             lines.append(f"  {fault_type} (N={ft_metrics['num_windows']}):")
-            lines.append(f"    Window F1: {ft_metrics['window_f1']:.4f}")
-            lines.append(f"    Sensor F1: {ft_metrics['sensor_f1']:.4f}")
+            if 'fault_type_match_accuracy' in ft_metrics:
+                lines.append(
+                    f"    Fault-type match: {ft_metrics['fault_type_match_accuracy']:.4f} "
+                    f"({ft_metrics.get('fault_type_correct', '?')}/{ft_metrics['num_windows']} windows)"
+                )
+            lines.append(f"    Sensor F1:        {ft_metrics['sensor_f1']:.4f}")
         lines.append("")
     
     lines.append("="*80)

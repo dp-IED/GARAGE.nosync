@@ -42,7 +42,10 @@ FAULT_TYPE_DESCRIPTIONS = {
     "MAF_SCALE_LOW": "intake manifold pressure reads consistently ~20% lower than normal throughout the window",
     "TPS_STUCK": "throttle position freezes at a constant value from roughly the midpoint onward (near-zero variability in second half)",
     "VSS_DROPOUT": "vehicle speed drops to near-zero for roughly the middle third of the window then recovers",
-    "gradual_drift": "RPM, engine load, or fuel trim shows a sustained spike, dropout, or gradual drift across the window",
+    "RPM_SPIKE_DROPOUT": "engine RPM shows a sharp spike (up to ~1.8x normal) or dropout (down to ~0.4x) in the middle half of the window",
+    "LOAD_SCALE_LOW": "engine load reads uniformly lower than normal throughout the window (scaled to roughly 25-60% of expected)",
+    "STFT_STUCK_HIGH": "short-term fuel trim freezes at an elevated value in the middle 40% of the window",
+    "LTFT_DRIFT_HIGH": "long-term fuel trim is shifted consistently higher than normal throughout the entire window",
 }
 
 SYSTEM_PROMPT = """You are an automotive OBD-II fault diagnostics system.
@@ -222,6 +225,7 @@ def evaluate_llm_baseline(
     unnormalized_windows = data["unnormalized_windows"]
     sensor_labels_true = data["sensor_labels"]
     window_labels_true = data["window_labels"]
+    ref_reasoning_full = data["reference_reasoning"].tolist() if "reference_reasoning" in data else None
 
     # Load metadata
     metadata_path = dataset_path.parent / f"{dataset_path.stem}_metadata.json"
@@ -265,6 +269,8 @@ def evaluate_llm_baseline(
             sensor_labels_true = sensor_labels_true[sample_indices]
             window_labels_true = window_labels_true[sample_indices]
             fault_types_full = fault_types_full[sample_indices]
+            if ref_reasoning_full is not None:
+                ref_reasoning_full = [ref_reasoning_full[j] for j in sample_indices]
             if statistical_features is not None and len(statistical_features) == num_windows_full:
                 statistical_features = statistical_features[sample_indices]
             print(f"  ⚠️  LIMIT MODE: Stratified sample of {num_windows} windows (seed={seed})")
@@ -277,6 +283,8 @@ def evaluate_llm_baseline(
             window_labels_true = window_labels_true[ix]
             if fault_types_full is not None:
                 fault_types_full = fault_types_full[ix]
+            if ref_reasoning_full is not None:
+                ref_reasoning_full = ref_reasoning_full[:limit]
             if statistical_features is not None and len(statistical_features) == num_windows_full:
                 statistical_features = statistical_features[ix]
             print(
@@ -362,6 +370,14 @@ def evaluate_llm_baseline(
             window_labels_true_converted[i] = 0  # No fault
     window_labels_true = window_labels_true_converted
 
+    # Build aligned reference reasoning list (same length as predictions)
+    n_pred = len(reasoning_list)
+    if ref_reasoning_full is not None:
+        ref_reasoning_list = list(ref_reasoning_full[:n_pred])
+        ref_reasoning_list += [""] * max(0, n_pred - len(ref_reasoning_list))
+    else:
+        ref_reasoning_list = [""] * n_pred
+
     # Compute metrics
     print("Computing evaluation metrics...")
 
@@ -374,8 +390,10 @@ def evaluate_llm_baseline(
         sensor_names=sensor_names,
         fault_types=fault_types_full if fault_types_full is not None else None,
         fault_types_pred=fault_types_pred,
+        reasoning=reasoning_list,
+        reference_reasoning=ref_reasoning_list,
     )
-    
+
     # Also compute raw metrics for comparison
     metrics_raw = compute_all_metrics(
         y_true_window=window_labels_true,
@@ -489,19 +507,15 @@ def run(
         sensor_names = meta["dataset_info"]["sensor_names"]
 
     results = []
-    is_faulty_list = preds.get("is_faulty", [])
     for i in range(len(preds["window_labels"])):
-        wl_pred = preds["window_labels"][i]
         sl_pred = preds["sensor_labels"][i]
         ft_pred = preds["fault_types"][i]
         reasoning = preds["reasoning"][i] if i < len(preds["reasoning"]) else ""
         sl_true = sensor_labels_true[i].tolist()
         wl_true = 1 if sum(sl_true) > 0 else 0
-        # Use the direct is_faulty boolean when available; fall back to sensor-derived
-        if i < len(is_faulty_list):
-            wl_pred_bin = int(is_faulty_list[i])
-        else:
-            wl_pred_bin = 1 if wl_pred > 0 else 0
+        # Unified binary window prediction derived from sensor-indexed window_label (0=normal)
+        # to stay consistent with the sensor-indexed window_label stored in results/*.json.
+        wl_pred_bin = 1 if int(preds["window_labels"][i]) > 0 else 0
         ft_true = fault_types[i] if fault_types is not None and i < len(fault_types) else None
         ft_true_str = "normal" if (ft_true is None or ft_true == "" or wl_true == 0) else str(ft_true)
         ft_pred_str = "normal" if (ft_pred is None or ft_pred == "") else str(ft_pred)
