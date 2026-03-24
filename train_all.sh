@@ -83,7 +83,7 @@ if [ ! -f "$STAGE1_CHECKPOINT" ]; then
     exit 1
 fi
 
-python training/train_stage2_clean.py \
+python training/train_stage2.py \
     --stage1_checkpoint "$STAGE1_CHECKPOINT" \
     --data_path "$SHARED_DATASET_DIR" \
     --epochs "$STAGE2_EPOCHS" \
