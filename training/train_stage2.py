@@ -165,23 +165,6 @@ def _sensor_weight_scale(
     return scale_init - (scale_init - scale_min) * min(progress, 1.0)
 
 
-def _focal_bce_with_logits(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-    pos_weight: torch.Tensor,
-    gamma: float = 2.0,
-    reduction: str = "mean",
-) -> torch.Tensor:
-    p = torch.sigmoid(logits)
-    p_t = p * targets + (1 - p) * (1 - targets)
-    bce = F.binary_cross_entropy_with_logits(
-        logits, targets, pos_weight=pos_weight, reduction="none"
-    )
-    focal_weight = (1 - p_t).clamp(min=1e-4) ** gamma
-    loss = focal_weight * bce
-    return loss.mean() if reduction == "mean" else loss
-
-
 def _best_f1_threshold(scores: torch.Tensor, labels: torch.Tensor) -> float:
     if scores.numel() == 0:
         return 0.5
@@ -448,8 +431,6 @@ def train_stage2_clean(
     freeze_backbone_epochs: int = 3,
     use_calibrated_threshold_for_checkpoint: bool = True,
     num_workers: int = 4,
-    use_focal_loss: bool = False,
-    focal_gamma: float = 2.0,
     scheduler_patience: int = 15,
     scheduler_factor: float = 0.7,
     lr_min: float = 1e-6,
@@ -741,20 +722,12 @@ def train_stage2_clean(
                         sensor_logits, global_logits, sensor_embeddings = model(
                             X_batch, return_global=True, return_sensor_embeddings=True
                         )
-                        if use_focal_loss:
-                            loss_sensor = _focal_bce_with_logits(
-                                sensor_logits,
-                                sensor_labels_batch,
-                                current_sensor_pos_weight,
-                                gamma=focal_gamma,
-                            )
-                        else:
-                            loss_sensor = F.binary_cross_entropy_with_logits(
-                                sensor_logits,
-                                sensor_labels_batch,
-                                pos_weight=current_sensor_pos_weight,
-                                reduction="none",
-                            ).mean()
+                        loss_sensor = F.binary_cross_entropy_with_logits(
+                            sensor_logits,
+                            sensor_labels_batch,
+                            pos_weight=current_sensor_pos_weight,
+                            reduction="none",
+                        ).mean()
                         # Training: use global logits directly — cleaner gradient signal
                         loss_window = F.binary_cross_entropy_with_logits(
                             global_logits.squeeze(-1),
@@ -769,20 +742,12 @@ def train_stage2_clean(
                     sensor_logits, global_logits, sensor_embeddings = model(
                         X_batch, return_global=True, return_sensor_embeddings=True
                     )
-                    if use_focal_loss:
-                        loss_sensor = _focal_bce_with_logits(
-                            sensor_logits,
-                            sensor_labels_batch,
-                            current_sensor_pos_weight,
-                            gamma=focal_gamma,
-                        )
-                    else:
-                        loss_sensor = F.binary_cross_entropy_with_logits(
-                            sensor_logits,
-                            sensor_labels_batch,
-                            pos_weight=current_sensor_pos_weight,
-                            reduction="none",
-                        ).mean()
+                    loss_sensor = F.binary_cross_entropy_with_logits(
+                        sensor_logits,
+                        sensor_labels_batch,
+                        pos_weight=current_sensor_pos_weight,
+                        reduction="none",
+                    ).mean()
                     # Training: use global logits directly — cleaner gradient signal
                     loss_window = F.binary_cross_entropy_with_logits(
                         global_logits.squeeze(-1),
@@ -871,20 +836,12 @@ def train_stage2_clean(
                 sensor_logits, global_logits, sensor_embeddings = model(
                     X_batch, return_global=True, return_sensor_embeddings=True
                 )
-                if use_focal_loss:
-                    loss_sensor = _focal_bce_with_logits(
-                        sensor_logits,
-                        sensor_labels_batch,
-                        current_sensor_pos_weight,
-                        gamma=focal_gamma,
-                    )
-                else:
-                    loss_sensor = F.binary_cross_entropy_with_logits(
-                        sensor_logits,
-                        sensor_labels_batch,
-                        pos_weight=current_sensor_pos_weight,
-                        reduction="none",
-                    ).mean()
+                loss_sensor = F.binary_cross_entropy_with_logits(
+                    sensor_logits,
+                    sensor_labels_batch,
+                    pos_weight=current_sensor_pos_weight,
+                    reduction="none",
+                ).mean()
                 # Val loss: BCE on global_logits (consistent with training)
                 loss_window = F.binary_cross_entropy_with_logits(
                     global_logits.squeeze(-1),
@@ -1390,17 +1347,6 @@ def main():
         help="Use train thresholds (0.5) in checkpoint instead of calibrated (default: save calibrated)",
     )
     parser.add_argument(
-        "--use_focal_loss",
-        action="store_true",
-        help="Use focal loss for sensor BCE instead of standard BCE",
-    )
-    parser.add_argument(
-        "--focal_gamma",
-        type=float,
-        default=2.0,
-        help="Focal loss gamma (default: 2.0)",
-    )
-    parser.add_argument(
         "--scheduler_patience",
         type=int,
         default=15,
@@ -1622,8 +1568,6 @@ def main():
         freeze_backbone_epochs=args.freeze_backbone_epochs,
         use_calibrated_threshold_for_checkpoint=not args.no_calibrated_threshold_for_checkpoint,
         num_workers=args.num_workers,
-        use_focal_loss=args.use_focal_loss,
-        focal_gamma=args.focal_gamma,
         scheduler_patience=args.scheduler_patience,
         scheduler_factor=args.scheduler_factor,
         lr_min=args.lr_min,
