@@ -109,27 +109,58 @@ def compute_fault_type_classification_metrics(y_true_types, y_pred_types):
     }
 
 
-def compute_bertscore(references, hypotheses, lang="en"):
+def compute_bertscore(references, hypotheses, lang="en", device=None):
     """
     BERTScore for reasoning quality (faulty windows only).
 
     Returns precision/recall/f1 as semantic similarity scores in [0, 1],
     not as classifier precision/recall. Higher = generated reasoning is more
     semantically similar to the reference explanation.
-    """
-    if not references or not hypotheses:
-        return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
-    try:
-        from bert_score import score as bert_score
 
-        P, R, F = bert_score(hypotheses, references, lang=lang, verbose=False)
+    Uses CUDA when available; otherwise CPU (avoids passing ``device=None``, which
+    can pick backends that break on some macOS setups).
+
+    Raises if ``bert-score`` / torch are missing or if scoring fails — LLM evals
+    must not silently substitute zeros. Empty ``references`` returns zeros (no
+    faulty-window pairs to score).
+    """
+    if len(references) != len(hypotheses):
+        raise ValueError(
+            f"BERTScore: length mismatch (refs={len(references)}, hyps={len(hypotheses)})."
+        )
+
+    if not references:
+        return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+
+    try:
+        import torch
+        from bert_score import score as bert_score_fn
+    except ImportError as e:
+        raise ImportError(
+            "BERTScore requires `bert-score` (and torch). "
+            "Install with: pip install bert-score  (see requirements.txt)"
+        ) from e
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    refs = [str(r) if r is not None else "" for r in references]
+    hyps = [str(h) if h is not None else "" for h in hypotheses]
+
+    try:
+        P, R, F = bert_score_fn(
+            hyps, refs, lang=lang, verbose=False, device=device, batch_size=32
+        )
         return {
             "precision": float(P.mean().item()),
             "recall": float(R.mean().item()),
             "f1": float(F.mean().item()),
         }
-    except ImportError:
-        return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+    except Exception as e:
+        raise RuntimeError(
+            f"BERTScore computation failed ({type(e).__name__}: {e}). "
+            "Resolve the error before treating eval results as valid."
+        ) from e
 
 
 def compute_all_metrics_unified(results, sensor_cols):
@@ -580,18 +611,35 @@ def compute_all_metrics(
 
     # BERTScore: semantic similarity between generated and reference reasoning (faulty windows only)
     if reasoning is not None and reference_reasoning is not None:
-        try:
-            faulty_mask = (
-                window_is_faulty_true > 0
-                if window_is_faulty_true is not None
-                else y_true_window > 0
+        n = int(np.asarray(y_true_window).shape[0])
+        if len(reasoning) != n or len(reference_reasoning) != n:
+            raise ValueError(
+                f"BERTScore alignment error: len(y_true_window)={n}, "
+                f"len(reasoning)={len(reasoning)}, "
+                f"len(reference_reasoning)={len(reference_reasoning)}"
             )
-            refs = [reference_reasoning[i] or "" for i in range(len(faulty_mask)) if faulty_mask[i]]
-            hyps = [reasoning[i] or "" for i in range(len(faulty_mask)) if faulty_mask[i]]
-            metrics['bertscore'] = compute_bertscore(refs, hyps)
-        except Exception as e:
-            import warnings
-            warnings.warn(f"BERTScore computation failed and will be absent from results: {e}")
+
+        faulty_mask = (
+            np.asarray(window_is_faulty_true) > 0
+            if window_is_faulty_true is not None
+            else np.asarray(y_true_window) > 0
+        )
+        faulty_mask = faulty_mask.astype(bool)
+        n_faulty = int(np.sum(faulty_mask))
+        refs = [
+            reference_reasoning[i] or ""
+            for i in range(n)
+            if faulty_mask[i]
+        ]
+        hyps = [reasoning[i] or "" for i in range(n) if faulty_mask[i]]
+        if n_faulty > 0 and len(refs) == 0:
+            raise ValueError(
+                "BERTScore: faulty_mask marks faulty windows but extracted no ref/hyp pairs"
+            )
+        if n_faulty == 0:
+            metrics["bertscore"] = {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+        else:
+            metrics["bertscore"] = compute_bertscore(refs, hyps)
 
     return metrics
 
@@ -687,6 +735,15 @@ def format_metrics_report(metrics: Dict[str, any]) -> str:
                     f"({ft_metrics.get('fault_type_correct', '?')}/{ft_metrics['num_windows']} windows)"
                 )
             lines.append(f"    Sensor F1:        {ft_metrics['sensor_f1']:.4f}")
+        lines.append("")
+
+    if "bertscore" in metrics:
+        bs = metrics["bertscore"]
+        lines.append("BERTScore (faulty windows only; semantic similarity):")
+        lines.append("-" * 40)
+        lines.append(
+            f"  Precision: {bs['precision']:.4f}  Recall: {bs['recall']:.4f}  F1: {bs['f1']:.4f}"
+        )
         lines.append("")
     
     lines.append("="*80)
@@ -903,3 +960,56 @@ def plot_distance_distributions(
         print(f"  ✓ Saved distance distribution plot to {save_path}")
     
     return fig
+
+
+def _bertscore_smoke_test() -> None:
+    """
+    Quick sanity check (no LLM): tiny BERTScore call + optional replay from
+    results/gdn_kg_llm.json + test.npz when those files exist.
+    Run from repo root:  python llm/evaluation/metrics.py
+    """
+    import json
+    from pathlib import Path
+
+    tiny = compute_bertscore(
+        ["The coolant temperature sensor shows intermittent dropout."],
+        ["Coolant temp dropped unexpectedly, affecting related sensors."],
+    )
+    assert tiny["f1"] > 0.2, f"expected non-degenerate BERTScore, got {tiny}"
+
+    root = Path(__file__).resolve().parents[2]
+    res_path = root / "results" / "gdn_kg_llm.json"
+    npz_path = root / "data" / "shared_dataset" / "test.npz"
+    if not (res_path.is_file() and npz_path.is_file()):
+        print("BERTScore smoke: tiny test OK", tiny)
+        return
+
+    with open(res_path) as f:
+        d = json.load(f)
+    si = d.get("sample_indices")
+    if not si:
+        print("BERTScore smoke: tiny test OK", tiny)
+        return
+
+    import numpy as np
+
+    si = np.array(si, dtype=np.int64)
+    data = np.load(npz_path, allow_pickle=True)
+    sl = data["sensor_labels"][si]
+    rr = data["reference_reasoning"][si]
+    reasoning = d["predictions"]["reasoning"]
+    y_true = np.zeros(len(si), dtype=np.int64)
+    for i in range(len(si)):
+        fi = np.where(sl[i] > 0)[0]
+        y_true[i] = int(fi[0] + 1) if len(fi) else 0
+    faulty = y_true > 0
+    refs = [str(rr[i]) for i in range(len(si)) if faulty[i]]
+    hyps = [str(reasoning[i]) for i in range(len(si)) if faulty[i]]
+    replay = compute_bertscore(refs, hyps)
+    assert replay["f1"] > 0.2, f"replay BERTScore degenerate: {replay}"
+    print("BERTScore smoke: tiny OK", tiny)
+    print(f"BERTScore smoke: replay {len(refs)} faulty windows F1={replay['f1']:.4f}")
+
+
+if __name__ == "__main__":
+    _bertscore_smoke_test()
