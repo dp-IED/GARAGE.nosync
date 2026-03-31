@@ -74,7 +74,6 @@ from training.fault_injection import inject_faults_with_sensor_labels
 # Fault percentages: train/val 25%, test 30%
 TRAIN_VAL_FAULT_PCT = 0.25
 TEST_FAULT_PCT = 0.30
-MIN_WINDOWS_PER_DRIVE = 30
 
 
 def compute_statistical_features(window_data: np.ndarray) -> np.ndarray:
@@ -117,30 +116,6 @@ def _generate_reference_reasoning(
     return templates.get(fault_type, f"Anomalous behavior detected in {affected_str}.")
 
 
-def _drop_sparse_drives(
-    X: np.ndarray,
-    drive_ids: np.ndarray,
-    extras: Dict[str, np.ndarray],
-) -> tuple:
-    """Remove windows from drives with fewer than MIN_WINDOWS_PER_DRIVE windows."""
-    counts = pd.Series(drive_ids).value_counts()
-    valid = counts[counts >= MIN_WINDOWS_PER_DRIVE].index
-    mask = np.isin(drive_ids, valid)
-    if (~mask).sum() > 0:
-        dropped_drives = (counts < MIN_WINDOWS_PER_DRIVE).sum()
-        print(
-            f"  [Filter] Kept {mask.sum()} windows from {len(valid)} drives "
-            f"(dropped {(~mask).sum()} windows from {dropped_drives} drives with <{MIN_WINDOWS_PER_DRIVE} windows)"
-        )
-    X = X[mask]
-    drive_ids = drive_ids[mask]
-    filtered_extras = {
-        k: v[mask] if isinstance(v, (np.ndarray, torch.Tensor)) else v
-        for k, v in extras.items()
-    }
-    return X, drive_ids, filtered_extras, mask
-
-
 def _inverse_transform_windows(X_norm: np.ndarray, scaler) -> np.ndarray:
     """Inverse-transform (N, W, D) normalized windows back to raw sensor values."""
     N, W, D = X_norm.shape
@@ -181,13 +156,8 @@ def process_split(
     y_forecast = y_forecast.numpy()  # (N, num_horizons, D)
     drive_ids_arr = np.array(drive_ids_arr)
 
-    # Remove drives with too few windows
-    X_clean_norm, drive_ids_arr, extras, mask = _drop_sparse_drives(
-        X_clean_norm, drive_ids_arr, {"y_forecast": y_forecast}
-    )
-    y_forecast = extras["y_forecast"]
     N = len(X_clean_norm)
-    print(f"  After filter: {N} windows")
+    print(f"  Windows: {N} (all drives retained; no min-windows-per-drive filter)")
 
     # Optional cap
     if max_windows and N > max_windows:
