@@ -1,0 +1,57 @@
+{
+  "main": {
+    "description": "Main repo: test.npz with sparse-drive filter (historical); Stage2 checkpoint stage2_clean_stage2_clean_best.pt (file dated Mar 16; dataset Mar 22 \u2014 may not be same training run).",
+    "num_windows": 1549,
+    "results_json": "/Users/darenpalmer/Desktop/UCL/CS/GARAGE.nosync/results/gdn_only_main_sparse_filter.json"
+  },
+  "worktree": {
+    "description": "Ablation worktree: test.npz without sparse filter + train_all checkpoint (Mar 31).",
+    "num_windows": 1614,
+    "results_json": "/Users/darenpalmer/Desktop/UCL/CS/GARAGE.nosync/.worktrees/sparse-drive-ablation/results/gdn_only_no_sparse_filter.json"
+  },
+  "metrics": [
+    {
+      "metric": "window_accuracy",
+      "main": 0.965139,
+      "worktree": 0.854399,
+      "delta_worktree_minus_main": -0.11074
+    },
+    {
+      "metric": "window_f1_weighted",
+      "main": 0.960347,
+      "worktree": 0.8238,
+      "delta_worktree_minus_main": -0.136546
+    },
+    {
+      "metric": "window_f1_macro",
+      "main": 0.836751,
+      "worktree": 0.547448,
+      "delta_worktree_minus_main": -0.289303
+    },
+    {
+      "metric": "sensor_accuracy",
+      "main": 0.99532,
+      "worktree": 0.979012,
+      "delta_worktree_minus_main": -0.016308
+    },
+    {
+      "metric": "sensor_f1",
+      "main": 0.934978,
+      "worktree": 0.6731,
+      "delta_worktree_minus_main": -0.261877
+    },
+    {
+      "metric": "sensor_precision",
+      "main": 1.0,
+      "worktree": 0.827893,
+      "delta_worktree_minus_main": -0.172107
+    },
+    {
+      "metric": "sensor_recall",
+      "main": 0.877895,
+      "worktree": 0.567073,
+      "delta_worktree_minus_main": -0.310822
+    }
+  ],
+  "interpretation_note": "Lower worktree scores may reflect retraining quality, expanded/harder test set, or uncommitted code changes in the worktree \u2014 not the sparse filter alone."
+}
