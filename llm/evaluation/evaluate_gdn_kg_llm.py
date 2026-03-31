@@ -8,6 +8,19 @@ This script:
 3. Runs LLM inference
 4. Compares predictions to ground truth
 5. Computes evaluation metrics
+
+Paired evaluation (same windows as LLM baseline and GDN-only runs):
+  Stratified --limit draws a different set of rows for each limit value (it is not the first N
+  windows of a larger run). To compare GDN-only, GDN+KG+LLM, and LLM-only fairly, use the same
+  --limit, --stratified-limit-seed (here) and evaluate_llm_baseline.py --seed, and write GDN-only
+  results to a path that records N, e.g.:
+
+    python llm/evaluation/evaluate_gdn_kg_llm.py --mode gdn_only --limit 400 \\
+      --stratified-limit-seed 42 --model-path ... --output results/gdn_only_400_strat.json
+
+  Then run full KG+LLM and llm_baseline with the same --limit 400 (defaults write
+  results/gdn_kg_llm.json and results/llm_baseline.json). ablations/compare_results.py checks that
+  sample_indices match before plotting methods on one figure.
 """
 
 import numpy as np
@@ -389,8 +402,6 @@ def run_kg_sanity_check(
             gdn_predictions=kg_data["gdn_predictions"],
             propagation_per_sensor_thresholds=per_sensor_thr_list,
             X_windows_unnormalized=kg_data.get("X_windows_unnormalized"),
-            sensor_labels_true=sensor_labels_true,
-            window_labels_true=window_labels_true,
         )
 
         sanity_contexts = kg.precompute_window_contexts(
@@ -846,8 +857,6 @@ def evaluate_gdn_kg_llm(
         gdn_predictions=kg_preds["gdn_predictions"],
         propagation_per_sensor_thresholds=per_sensor_thr_list,
         X_windows_unnormalized=unnormalized_windows,
-        sensor_labels_true=sensor_labels_true,
-        window_labels_true=window_labels_true,
     )
     kg_build_time = time.time() - _kg_start
 

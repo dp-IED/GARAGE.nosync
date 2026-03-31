@@ -7,6 +7,11 @@ This script:
 3. Runs LLM inference
 4. Compares predictions to ground truth
 5. Computes evaluation metrics
+
+Paired evaluation: stratified --limit uses a different sample of windows for each limit N (see
+llm/evaluation/stratified_sampling.py). Use the same --limit and --seed as
+evaluate_gdn_kg_llm.py --stratified-limit-seed when comparing to GDN+KG+LLM or GDN-only JSONs.
+compare_results.py only overlays series that share identical sample_indices in the saved JSON.
 """
 
 import numpy as np

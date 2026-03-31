@@ -12,6 +12,8 @@ Usage:
     python kg/create_kg.py --model_path checkpoints/stage2_clean_phase2_50ep_*/stage2_clean_best.pt --data_path data/carOBD/obdiidata --output_path kg_output/graph.pkl
 
 Note: Only Stage 2 clean checkpoints (stage2_clean_best.pt from train_stage2_clean.py) are accepted.
+      Distribution thresholds are computed upfront from the full GDN predictions array before
+      window processing begins, enabling a single construction pass.
 """
 
 import os
@@ -448,40 +450,6 @@ class GDNPredictor:
         }
 
 
-def extract_window_embeddings(
-    model: GDN, X_windows: np.ndarray, batch_size: int = 32, device: str = "cpu"
-) -> np.ndarray:
-    """
-    Extract window embeddings for distance-based scoring.
-
-    Args:
-        model: Trained GDN model
-        X_windows: (num_windows, window_size, num_sensors) input windows
-        batch_size: Batch size for inference
-        device: Device to run on
-
-    Returns:
-        embeddings: (num_windows, hidden_dim) numpy array of embeddings
-    """
-    if isinstance(X_windows, np.ndarray):
-        X_windows = torch.from_numpy(X_windows).float()
-
-    num_windows = X_windows.shape[0]
-    X_windows = X_windows.to(device)
-
-    all_embeddings = []
-    model.eval()
-
-    with torch.no_grad():
-        for i in range(0, num_windows, batch_size):
-            batch = X_windows[i : i + batch_size]
-            embeddings = model.get_embeddings(batch)  # (B, hidden_dim)
-            all_embeddings.append(embeddings.cpu().numpy())
-
-    embeddings = np.concatenate(all_embeddings, axis=0)
-    return embeddings
-
-
 # ============================================================================
 # KnowledgeGraph Class
 # ============================================================================
@@ -523,7 +491,6 @@ class KnowledgeGraph:
         self.kg = nx.MultiDiGraph()  # Main knowledge graph
         self.window_graphs = {}  # Per-window graphs
         self.window_stats = {}  # Per-window statistics
-        self.window_embeddings = {}  # Per-window embedding data
         self.anomaly_propagation_chains = []  # Fault propagation chains
         self.distribution_thresholds = None  # Distribution-based thresholds
         self.X_windows = None  # Normalized windows
@@ -564,21 +531,19 @@ class KnowledgeGraph:
         gdn_predictions: np.ndarray,
         propagation_per_sensor_thresholds: List[float],
         X_windows_unnormalized: Optional[np.ndarray] = None,
-        sensor_labels_true: Optional[np.ndarray] = None,
-        window_labels_true: Optional[np.ndarray] = None,
     ) -> "KnowledgeGraph":
         """
         Main method: Build KG by traversing windows temporally.
 
         Builds knowledge graph from GDN model outputs (predictions), NOT ground truth labels.
+        Distribution thresholds are computed upfront from ``gdn_predictions`` so that window
+        processing uses the correct 95th-percentile thresholds in a single pass.
 
         Args:
             X_windows: (num_windows, window_size, num_sensors) normalized sensor data windows
             gdn_predictions: (num_windows, num_sensors) GDN anomaly scores (0.0-1.0) per sensor per window
             propagation_per_sensor_thresholds: Stage-2 calibrated τ per sensor, same order as ``sensor_names``
             X_windows_unnormalized: (num_windows, window_size, num_sensors) unnormalized windows (optional)
-            sensor_labels_true: Optional (num_windows, num_sensors) ground truth labels (for thresholds only)
-            window_labels_true: Optional (num_windows,) ground truth window labels (for thresholds only)
 
         Returns:
             self (for method chaining)
@@ -595,7 +560,9 @@ class KnowledgeGraph:
         self.X_windows = X_windows
         self.X_windows_unnormalized = X_windows_unnormalized
 
-        # First pass: Process all windows
+        # Compute distribution thresholds upfront so the single window pass uses them directly
+        self.distribution_thresholds = self._compute_distribution_thresholds(gdn_predictions)
+
         print(f"Processing {num_windows} windows...")
         for window_idx in tqdm(range(num_windows), desc="Building KG"):
             window_data = X_windows[window_idx]
@@ -611,19 +578,6 @@ class KnowledgeGraph:
                     gdn_predictions[window_idx - 1],
                     window_gdn_scores,
                 )
-
-        # Compute distribution-based thresholds
-        self.distribution_thresholds = self._compute_distribution_thresholds(
-            gdn_predictions, sensor_labels_true, window_labels_true
-        )
-
-        # Second pass: Update edges with distribution-based thresholds
-        for window_idx in range(num_windows):
-            window_data = X_windows[window_idx]
-            window_gdn_scores = gdn_predictions[window_idx]
-            self._update_edges_with_thresholds(
-                window_idx, window_data, window_gdn_scores
-            )
 
         self._track_anomaly_propagation(gdn_predictions)
 
@@ -668,18 +622,10 @@ class KnowledgeGraph:
         correlation_matrix = np.corrcoef(window_data.T)
         window_graph = nx.Graph()
 
-        # Get thresholds
-        if self.distribution_thresholds:
-            thresholds = self.distribution_thresholds
-            anomaly_threshold_per_sensor = thresholds.get(
-                "anomaly_threshold_per_sensor", {}
-            )
-            anomaly_threshold_global = thresholds.get("anomaly_threshold_global", 0.5)
-            deviation_threshold = thresholds.get("deviation_threshold", 0.3)
-        else:
-            anomaly_threshold_per_sensor = {}
-            anomaly_threshold_global = 0.5
-            deviation_threshold = 0.3
+        thresholds = self.distribution_thresholds
+        anomaly_threshold_per_sensor = thresholds.get("anomaly_threshold_per_sensor", {})
+        anomaly_threshold_global = thresholds.get("anomaly_threshold_global", 0.5)
+        deviation_threshold = thresholds.get("deviation_threshold", 0.3)
 
         # Add nodes
         for sensor_name, stats in window_stats.items():
@@ -910,91 +856,28 @@ class KnowledgeGraph:
     def _compute_distribution_thresholds(
         self,
         gdn_predictions: np.ndarray,
-        sensor_labels_true: Optional[np.ndarray] = None,
-        window_labels_true: Optional[np.ndarray] = None,
     ) -> Dict[str, Any]:
-        """Compute distribution-based thresholds."""
-        all_anomaly_scores = []
-        per_sensor_scores = {sensor_name: [] for sensor_name in self.sensor_names}
+        """
+        Compute 95th-percentile distribution thresholds from the full predictions array.
 
-        for window_idx, window_stats in self.window_stats.items():
-            for sensor_name, stats in window_stats.items():
-                score = stats.anomaly_score
-                all_anomaly_scores.append(score)
-                per_sensor_scores[sensor_name].append(score)
-
-        if len(all_anomaly_scores) > 0:
-            anomaly_threshold_global = float(np.percentile(all_anomaly_scores, 95))
-        else:
-            anomaly_threshold_global = 0.5
+        Args:
+            gdn_predictions: (num_windows, num_sensors) GDN anomaly scores
+        """
+        flat = gdn_predictions.flatten()
+        anomaly_threshold_global = float(np.percentile(flat, 95)) if len(flat) > 0 else 0.5
 
         anomaly_threshold_per_sensor = {}
-        for sensor_name in self.sensor_names:
-            if len(per_sensor_scores[sensor_name]) > 0:
-                anomaly_threshold_per_sensor[sensor_name] = float(
-                    np.percentile(per_sensor_scores[sensor_name], 95)
-                )
-            else:
-                anomaly_threshold_per_sensor[sensor_name] = anomaly_threshold_global
+        for sensor_idx, sensor_name in enumerate(self.sensor_names):
+            scores = gdn_predictions[:, sensor_idx]
+            anomaly_threshold_per_sensor[sensor_name] = (
+                float(np.percentile(scores, 95)) if len(scores) > 0 else anomaly_threshold_global
+            )
 
         return {
             "anomaly_threshold_global": anomaly_threshold_global,
             "anomaly_threshold_per_sensor": anomaly_threshold_per_sensor,
             "deviation_threshold": 0.3,
         }
-
-    def _update_edges_with_thresholds(
-        self, window_idx: int, window_data: np.ndarray, gdn_scores: np.ndarray
-    ):
-        """Update edges with distribution-based thresholds."""
-        if window_idx not in self.window_graphs:
-            return
-
-        graph = self.window_graphs[window_idx]
-        window_stats = self.window_stats.get(window_idx, {})
-        thresholds = self.distribution_thresholds
-
-        if not thresholds:
-            return
-
-        anomaly_threshold = thresholds.get("anomaly_threshold_global", 0.5)
-        deviation_threshold = thresholds.get("deviation_threshold", 0.3)
-        correlation_matrix = np.corrcoef(window_data.T)
-
-        for i, sensor_i in enumerate(self.sensor_names):
-            for j, sensor_j in enumerate(self.sensor_names):
-                if i >= j or not graph.has_edge(sensor_i, sensor_j):
-                    continue
-
-                window_corr = correlation_matrix[i, j]
-                expected_corr_gdn = (
-                    self.adjacency_matrix[i, j]
-                    if self.adjacency_matrix is not None
-                    else window_corr
-                )
-                deviation_from_gdn = abs(window_corr - expected_corr_gdn)
-
-                stats_i = window_stats.get(sensor_i)
-                stats_j = window_stats.get(sensor_j)
-
-                if stats_i is None or stats_j is None:
-                    continue
-
-                edge_attrs = graph[sensor_i][sensor_j]
-                if edge_attrs.get("window_idx") == window_idx:
-                    edge_attrs["deviation_from_gdn"] = float(deviation_from_gdn)
-                    edge_attrs["violates_gdn_expectation"] = (
-                        deviation_from_gdn > deviation_threshold
-                    )
-
-                    if edge_attrs.get("violates_gdn_expectation", False):
-                        if (
-                            stats_i.anomaly_score > anomaly_threshold
-                            or stats_j.anomaly_score > anomaly_threshold
-                        ):
-                            edge_attrs["potential_fault_indicator"] = True
-                        else:
-                            edge_attrs["potential_fault_indicator"] = False
 
     def _stage2_threshold_for_sensor(
         self, sensor_name: str, per_sensor_thresholds: List[float]

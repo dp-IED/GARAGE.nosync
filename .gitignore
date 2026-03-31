@@ -28,5 +28,8 @@ data/shared_dataset/
 llm/evaluation/shared_dataset/
 demo/demo_cache.pkl
 
+# Git worktrees (local checkouts)
+.worktrees/
+
 # OS
 .DS_Store

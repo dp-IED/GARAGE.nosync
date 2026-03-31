@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
-Compare GDN, LSTM, and ARIMA results on the full test set, and plot LLM-based
-methods (GDN+KG+LLM vs LLM-only) when those result JSONs are present.
+Compare result JSONs under results/ and write figures under figures/.
 
-Also: ``python ablations/compare_results.py diagnose`` — binary FPR on normal
-windows and sensor-level false positives on the stratified slice (see plan).
+Model comparison chart: GDN (from evaluate_gdn_kg_llm.py --mode gdn_only), LSTM, ARIMA when present.
+Neural/LLM pipeline chart: GDN-only + GDN+KG+LLM + LLM-only **only if** JSONs share the same
+sample_indices (same --limit and stratified seed as in evaluate_llm_baseline.py / evaluate_gdn_kg_llm.py).
+A stratified --limit of 200 and 200 are different window sets than --limit 400, so LLM scores are
+not comparable across those runs — do not plot them on one bar chart.
+
+Also: ``python ablations/compare_results.py diagnose`` — binary FPR on normal windows and
+sensor-level false positives on the stratified slice (see plan).
 """
 
 import argparse
 import json
 from pathlib import Path
 import sys
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -28,93 +33,248 @@ def load_metrics(path: Path) -> dict:
         return json.load(f)
 
 
-def load_all_rows():
-    files = {
-        "GDN": RESULTS_DIR / "gdn_only.json",
-        "LSTM": RESULTS_DIR / "lstm_baseline.json",
-        "ARIMA": RESULTS_DIR / "arima_baseline.json",
-    }
-    rows = []
-    for name, path in files.items():
-        if not path.exists():
-            continue
-        d = load_metrics(path)
-        m = d["metrics"]
-        wl = m["window_level"]
-        sl = m["sensor_level"]
-        rows.append({
-            "method": name,
-            "num_windows": d["num_windows"],
-            "window_acc": wl["window_accuracy"],
-            "window_prec": wl["window_precision"],
-            "window_rec": wl["window_recall"],
-            "window_f1": wl["window_f1"],
-            "sensor_acc": sl["sensor_accuracy"],
-            "sensor_prec": sl["sensor_precision"],
-            "sensor_rec": sl["sensor_recall"],
-            "sensor_f1": sl["sensor_f1"],
-        })
-    return rows
+def same_eval_slice(doc_a: dict, doc_b: dict) -> bool:
+    """True if both JSONs refer to the same ordered set of dataset rows."""
+    si_a = doc_a.get("sample_indices")
+    si_b = doc_b.get("sample_indices")
+    if si_a is not None and si_b is not None:
+        return list(si_a) == list(si_b)
+    if si_a is None and si_b is None:
+        return int(doc_a["num_windows"]) == int(doc_b["num_windows"])
+    return False
 
 
-def load_llm_comparison_rows():
-    files = [
-        ("GDN+KG+LLM", RESULTS_DIR / "gdn_kg_llm.json"),
-        ("LLM only", RESULTS_DIR / "llm_baseline.json"),
+def find_matching_gdn_only_json(anchor: dict) -> Optional[Path]:
+    """GDN-only result whose sample_indices match anchor (e.g. gdn_kg_llm.json)."""
+    n = int(anchor["num_windows"])
+    candidates = [
+        RESULTS_DIR / f"gdn_only_{n}_strat.json",
+        RESULTS_DIR / "gdn_only_400_strat.json",
+        RESULTS_DIR / "gdn_only_200_strat.json",
+        RESULTS_DIR / "gdn_only.json",
     ]
+    tried: set[Path] = set()
+    for path in candidates:
+        if path in tried or not path.exists():
+            continue
+        tried.add(path)
+        d = load_metrics(path)
+        if d.get("method") != "gdn_only":
+            continue
+        if same_eval_slice(anchor, d):
+            return path
+    return None
+
+
+def find_matching_llm_baseline_json(anchor: dict) -> Optional[Path]:
+    for path in sorted(RESULTS_DIR.glob("llm_baseline*.json")):
+        d = load_metrics(path)
+        if d.get("method") != "llm_baseline":
+            continue
+        if same_eval_slice(anchor, d):
+            return path
+    return None
+
+
+def load_all_rows():
+    """GDN + LSTM + ARIMA for broad comparison (window counts may differ per file)."""
     rows = []
-    for name, path in files:
+    gdn_candidates = []
+    if (RESULTS_DIR / "gdn_kg_llm.json").exists():
+        n = int(load_metrics(RESULTS_DIR / "gdn_kg_llm.json")["num_windows"])
+        gdn_candidates.append(RESULTS_DIR / f"gdn_only_{n}_strat.json")
+    gdn_candidates.extend(
+        [
+            RESULTS_DIR / "gdn_only_400_strat.json",
+            RESULTS_DIR / "gdn_only_200_strat.json",
+            RESULTS_DIR / "gdn_only.json",
+        ]
+    )
+    seen_paths: set[Path] = set()
+    for path in gdn_candidates:
+        if path in seen_paths or not path.exists():
+            continue
+        seen_paths.add(path)
+        d = load_metrics(path)
+        if d.get("method") != "gdn_only":
+            continue
+        rows.append(_metrics_row("GDN", d))
+        break
+
+    for name, path in (
+        ("LSTM", RESULTS_DIR / "lstm_baseline.json"),
+        ("ARIMA", RESULTS_DIR / "arima_baseline.json"),
+    ):
         if not path.exists():
             continue
-        d = load_metrics(path)
-        m = d["metrics"]
-        wl = m["window_level"]
-        sl = m["sensor_level"]
-        rows.append({
-            "method": name,
-            "num_windows": d["num_windows"],
-            "window_acc": wl["window_accuracy"],
-            "window_prec": wl["window_precision"],
-            "window_rec": wl["window_recall"],
-            "window_f1": wl["window_f1"],
-            "sensor_acc": sl["sensor_accuracy"],
-            "sensor_prec": sl["sensor_precision"],
-            "sensor_rec": sl["sensor_recall"],
-            "sensor_f1": sl["sensor_f1"],
-        })
+        rows.append(_metrics_row(name, load_metrics(path)))
     return rows
 
 
-def save_llm_bar_chart():
-    rows = load_llm_comparison_rows()
-    if len(rows) < 2:
-        return
+def _metrics_row(name: str, d: dict) -> dict:
+    m = d["metrics"]
+    wl = m["window_level"]
+    sl = m["sensor_level"]
+    return {
+        "method": name,
+        "num_windows": d["num_windows"],
+        "stratified": bool(d.get("stratified_limit")),
+        "window_acc": wl["window_accuracy"],
+        "window_prec": wl["window_precision"],
+        "window_rec": wl["window_recall"],
+        "window_f1": wl["window_f1"],
+        "sensor_acc": sl["sensor_accuracy"],
+        "sensor_prec": sl["sensor_precision"],
+        "sensor_rec": sl["sensor_recall"],
+        "sensor_f1": sl["sensor_f1"],
+    }
 
-    methods = [r["method"] for r in rows]
+
+def load_pipeline_figure_rows() -> Tuple[list, list]:
+    """
+    Rows for llm_method_comparison.png: GDN-only, GDN+KG+LLM, LLM-only on the **same** eval slice
+    (matching sample_indices). Second return value is human-readable notes / missing-file hints.
+    """
+    notes: list = []
+    kg_path = RESULTS_DIR / "gdn_kg_llm.json"
+    if not kg_path.exists():
+        return [], ["No results/gdn_kg_llm.json — run evaluate_gdn_kg_llm.py (full mode)."]
+
+    kg = load_metrics(kg_path)
+    rows: list = []
+
+    gdn_path = find_matching_gdn_only_json(kg)
+    if gdn_path is not None:
+        rows.append(_metrics_row("GDN only", load_metrics(gdn_path)))
+    else:
+        n = int(kg["num_windows"])
+        seed = kg.get("stratified_limit_seed", 42)
+        notes.append(
+            "No matching GDN-only JSON for this slice. Run: "
+            f"python llm/evaluation/evaluate_gdn_kg_llm.py --mode gdn_only --limit {n} "
+            f"--stratified-limit-seed {seed} --model-path ... "
+            f"--output results/gdn_only_{n}_strat.json"
+        )
+
+    rows.append(_metrics_row("GDN+KG+LLM", kg))
+
+    llm_path = find_matching_llm_baseline_json(kg)
+    if llm_path is not None:
+        rows.append(_metrics_row("LLM only", load_metrics(llm_path)))
+    else:
+        notes.append(
+            "No llm_baseline*.json matches gdn_kg_llm sample_indices. Run evaluate_llm_baseline.py "
+            f"with the same --limit and --seed as KG eval (seed {kg.get('stratified_limit_seed', 42)})."
+        )
+
+    order = {"GDN only": 0, "GDN+KG+LLM": 1, "LLM only": 2}
+    rows.sort(key=lambda r: order.get(r["method"], 9))
+    return rows, notes
+
+
+def _plot_metric_bars(rows: list, title: str, out_name: str, figsize: tuple = (8, 5)) -> None:
+    if not rows:
+        return
     metrics = ["Window F1", "Window Acc", "Sensor F1", "Sensor Acc"]
     keys = ["window_f1", "window_acc", "sensor_f1", "sensor_acc"]
-
     x = np.arange(len(metrics))
-    width = 0.35
-    fig, ax = plt.subplots(figsize=(8, 5))
-
+    n = len(rows)
+    width = min(0.35, 0.8 / max(n, 1))
+    fig, ax = plt.subplots(figsize=figsize)
     for i, r in enumerate(rows):
         vals = [r[k] * 100 for k in keys]
-        offset = width * (i - 0.5)
+        offset = width * (i - (n - 1) / 2)
         ax.bar(x + offset, vals, width, label=r["method"])
-
-    nwin = rows[0]["num_windows"]
     ax.set_ylabel("Score (%)")
-    ax.set_title(f"GDN+KG+LLM vs LLM only ({nwin} windows)")
+    ax.set_title(title)
     ax.set_xticks(x)
     ax.set_xticklabels(metrics)
     ax.legend()
     ax.set_ylim(0, 105)
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0f}%"))
-
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
-    out = FIGURES_DIR / "llm_method_comparison.png"
+    out = FIGURES_DIR / out_name
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Saved: {out}")
+
+
+def save_llm_bar_chart():
+    rows, notes = load_pipeline_figure_rows()
+    for msg in notes:
+        print(f"Pipeline chart: {msg}")
+    if len(rows) < 2:
+        print("Skip llm_method_comparison.png: need gdn_kg_llm.json plus at least one matching series.")
+        return
+    kg = load_metrics(RESULTS_DIR / "gdn_kg_llm.json")
+    nwin = int(kg["num_windows"])
+    seed = kg.get("stratified_limit_seed", 42)
+    strat = bool(kg.get("stratified_limit"))
+    suffix = f"{nwin} windows"
+    if strat:
+        suffix += f", stratified (seed {seed})"
+    _plot_metric_bars(
+        rows,
+        f"Same eval slice — GDN / KG+LLM / LLM ({suffix}; sample_indices must match)",
+        "llm_method_comparison.png",
+        figsize=(9, 5),
+    )
+
+
+def save_overview_two_panel():
+    """Classical baselines vs same-slice neural/LLM pipeline."""
+    classical = load_all_rows()
+    llm_rows, _ = load_pipeline_figure_rows()
+    if not classical and len(llm_rows) < 2:
+        return
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    metrics = ["Win F1", "Win Acc", "Sen F1", "Sen Acc"]
+    keys = ["window_f1", "window_acc", "sensor_f1", "sensor_acc"]
+
+    if classical:
+        ax = axes[0]
+        x = np.arange(len(metrics))
+        w = min(0.25, 0.7 / len(classical))
+        for i, r in enumerate(classical):
+            vals = [r[k] * 100 for k in keys]
+            off = w * (i - (len(classical) - 1) / 2)
+            ax.bar(x + off, vals, w, label=r["method"])
+        ax.set_ylabel("Score (%)")
+        detail = ", ".join(f"{r['method']} n={r['num_windows']}" for r in classical)
+        ax.set_title(f"Baselines ({detail})")
+        ax.set_xticks(x)
+        ax.set_xticklabels(metrics)
+        ax.legend()
+        ax.set_ylim(0, 105)
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0f}%"))
+    else:
+        axes[0].set_visible(False)
+
+    if len(llm_rows) >= 2:
+        ax = axes[1]
+        x = np.arange(len(metrics))
+        n_b = len(llm_rows)
+        w = min(0.28, 0.75 / max(n_b, 1))
+        for i, r in enumerate(llm_rows):
+            vals = [r[k] * 100 for k in keys]
+            off = w * (i - (n_b - 1) / 2)
+            ax.bar(x + off, vals, w, label=r["method"])
+        ax.set_ylabel("Score (%)")
+        nwin = llm_rows[0]["num_windows"]
+        ax.set_title(f"Same slice: GDN / KG+LLM / LLM (n={nwin})")
+        ax.set_xticks(x)
+        ax.set_xticklabels(metrics)
+        ax.legend()
+        ax.set_ylim(0, 105)
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0f}%"))
+    else:
+        axes[1].set_visible(False)
+
+    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+    fig.suptitle("GARAGE — latest eval summary", fontsize=12, y=1.02)
+    fig.tight_layout()
+    out = FIGURES_DIR / "results_overview_panels.png"
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"Saved: {out}")
@@ -125,21 +285,21 @@ def save_bar_chart():
     if not rows:
         return
 
-    methods = [r["method"] for r in rows]
     metrics = ["Window F1", "Window Acc", "Sensor F1", "Sensor Acc"]
     keys = ["window_f1", "window_acc", "sensor_f1", "sensor_acc"]
 
     x = np.arange(len(metrics))
-    width = 0.25
+    n_r = len(rows)
+    width = min(0.22, 0.72 / max(n_r, 1))
     fig, ax = plt.subplots(figsize=(10, 6))
 
     for i, r in enumerate(rows):
         vals = [r[k] * 100 for k in keys]
-        offset = width * (i - len(rows) / 2 + 0.5)
-        ax.bar(x + offset, vals, width, label=r["method"])
+        offset = width * (i - (n_r - 1) / 2)
+        ax.bar(x + offset, vals, width, label=f"{r['method']} (n={r['num_windows']})")
 
     ax.set_ylabel("Score (%)")
-    ax.set_title("Model Comparison (full test set, 1549 windows)")
+    ax.set_title("Model comparison — GDN / LSTM / ARIMA (n = eval windows per series)")
     ax.set_xticks(x)
     ax.set_xticklabels(metrics)
     ax.legend()
@@ -199,13 +359,13 @@ def main_diagnose(argv: Optional[List[str]] = None) -> int:
         "--gdn-json",
         type=Path,
         default=None,
-        help="gdn_only results JSON (optional; default tries results/gdn_only_200_strat.json then gdn_only.json)",
+        help="gdn_only results JSON (optional; default: file matching gdn_kg_llm sample_indices, else first gdn_only*.json)",
     )
     parser.add_argument(
         "--baseline-json",
         type=Path,
         default=None,
-        help="llm_baseline JSON (optional; default tries llm_baseline_200_strat.json then llm_baseline.json)",
+        help="llm_baseline JSON (optional; default: llm_baseline*.json matching KG slice, else first match)",
     )
     parser.add_argument(
         "--audit",
@@ -225,6 +385,8 @@ def main_diagnose(argv: Optional[List[str]] = None) -> int:
         return 1
 
     kg = load_metrics(args.kg_json)
+    n_slice = int(kg["num_windows"])
+    seed_eval = kg.get("stratified_limit_seed", 42)
     sample_indices = kg.get("sample_indices")
 
     sl_true = _truth_sensor_labels(args.dataset, sample_indices)
@@ -247,20 +409,22 @@ def main_diagnose(argv: Optional[List[str]] = None) -> int:
 
     gdn_path = args.gdn_json
     if gdn_path is None:
-        for cand in (
-            RESULTS_DIR / "gdn_only_200_strat.json",
-            RESULTS_DIR / "gdn_only.json",
-        ):
-            if cand.exists():
-                gdn_path = cand
-                break
+        gdn_path = find_matching_gdn_only_json(kg)
+        if gdn_path is None:
+            for cand in (
+                RESULTS_DIR / f"gdn_only_{kg['num_windows']}_strat.json",
+                RESULTS_DIR / "gdn_only_400_strat.json",
+                RESULTS_DIR / "gdn_only_200_strat.json",
+                RESULTS_DIR / "gdn_only.json",
+            ):
+                if cand.exists():
+                    gdn_path = cand
+                    break
     bl_path = args.baseline_json
     if bl_path is None:
-        for cand in (
-            RESULTS_DIR / "llm_baseline_200_strat.json",
-            RESULTS_DIR / "llm_baseline.json",
-        ):
-            if cand.exists():
+        bl_path = find_matching_llm_baseline_json(kg)
+        if bl_path is None:
+            for cand in sorted(RESULTS_DIR.glob("llm_baseline*.json")):
                 bl_path = cand
                 break
 
@@ -308,8 +472,8 @@ def main_diagnose(argv: Optional[List[str]] = None) -> int:
     else:
         print(
             "GDN only              (skip — no JSON; run: python llm/evaluation/evaluate_gdn_kg_llm.py "
-            "--mode gdn_only --limit 200 --stratified-limit-seed 42 --model-path ... "
-            f"--output {RESULTS_DIR / 'gdn_only_200_strat.json'})"
+            f"--mode gdn_only --limit {n_slice} --stratified-limit-seed {seed_eval} --model-path ... "
+            f"--output {RESULTS_DIR / f'gdn_only_{n_slice}_strat.json'})"
         )
 
     bl_sl: Optional[np.ndarray] = None
@@ -326,7 +490,7 @@ def main_diagnose(argv: Optional[List[str]] = None) -> int:
     else:
         print(
             "LLM baseline          (skip — no JSON; run: python llm/evaluation/evaluate_llm_baseline.py "
-            f"--limit 200 --seed 42 --output {RESULTS_DIR / 'llm_baseline_200_strat.json'})"
+            f"--limit {n_slice} --seed {seed_eval} --output {RESULTS_DIR / 'llm_baseline.json'})"
         )
 
     print()
@@ -386,19 +550,63 @@ def main():
         return
 
     print("=" * 80)
-    print("Model Comparison (full test set, 1549 windows)")
+    print("Model comparison table: GDN (if present) + LSTM + ARIMA — per-file window counts")
     print("=" * 80)
     print()
-    print(f"{'Method':<10} {'Win Acc':>8} {'Win Prec':>8} {'Win Rec':>8} {'Win F1':>8}  {'Sen Acc':>8} {'Sen Prec':>8} {'Sen Rec':>8} {'Sen F1':>8}")
-    print("-" * 80)
+    print(f"{'Method':<16} {'Win Acc':>8} {'Win Prec':>8} {'Win Rec':>8} {'Win F1':>8}  {'Sen Acc':>8} {'Sen Prec':>8} {'Sen Rec':>8} {'Sen F1':>8}")
+    print("-" * 96)
     for r in rows:
-        print(f"{r['method']:<10} {r['window_acc']:>8.2%} {r['window_prec']:>8.2%} {r['window_rec']:>8.2%} {r['window_f1']:>8.2%}  {r['sensor_acc']:>8.2%} {r['sensor_prec']:>8.2%} {r['sensor_rec']:>8.2%} {r['sensor_f1']:>8.2%}")
+        print(
+            f"{r['method']:<16} {r['window_acc']:>8.2%} {r['window_prec']:>8.2%} {r['window_rec']:>8.2%} {r['window_f1']:>8.2%}  "
+            f"{r['sensor_acc']:>8.2%} {r['sensor_prec']:>8.2%} {r['sensor_rec']:>8.2%} {r['sensor_f1']:>8.2%}"
+        )
     print()
     print("Win = Window-level, Sen = Sensor-level")
     print()
 
     save_bar_chart()
     save_llm_bar_chart()
+    save_overview_two_panel()
+
+    print()
+    print("=" * 80)
+    print("Latest results snapshot (JSON in results/)")
+    print("=" * 80)
+    if (RESULTS_DIR / "gdn_kg_llm.json").exists():
+        kg_doc = load_metrics(RESULTS_DIR / "gdn_kg_llm.json")
+        gdn_m = find_matching_gdn_only_json(kg_doc)
+        llm_m = find_matching_llm_baseline_json(kg_doc)
+        print("\nSame-slice trio (matching sample_indices to gdn_kg_llm.json):")
+        for label, p in (
+            ("GDN+KG+LLM", RESULTS_DIR / "gdn_kg_llm.json"),
+            ("GDN only", gdn_m),
+            ("LLM only", llm_m),
+        ):
+            if p is None or not Path(p).exists():
+                print(f"  {label:<14}  (no matching JSON)")
+                continue
+            d = load_metrics(p)
+            wl = d["metrics"]["window_level"]
+            sl = d["metrics"]["sensor_level"]
+            print(
+                f"  {label:<14}  n={d['num_windows']:<4}  "
+                f"win_acc={wl['window_accuracy']:.2%}  win_f1={wl['window_f1']:.2%}  "
+                f"sen_acc={sl['sensor_accuracy']:.2%}  sen_f1={sl['sensor_f1']:.2%}  ({p.name})"
+            )
+    for solo, label in (
+        (RESULTS_DIR / "lstm_baseline.json", "LSTM full test"),
+        (RESULTS_DIR / "arima_baseline.json", "ARIMA (subset)"),
+    ):
+        if solo.exists():
+            d = load_metrics(solo)
+            wl = d["metrics"]["window_level"]
+            sl = d["metrics"]["sensor_level"]
+            print(
+                f"\n{label}:  n={d['num_windows']}  "
+                f"win_acc={wl['window_accuracy']:.2%}  win_f1={wl['window_f1']:.2%}  "
+                f"sen_acc={sl['sensor_accuracy']:.2%}  sen_f1={sl['sensor_f1']:.2%}  ({solo.name})"
+            )
+    print()
 
 
 if __name__ == "__main__":
