@@ -191,9 +191,7 @@ def load_gdn_model(model_path: str, device: str = "cpu") -> Tuple[GDN, Dict[str,
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
 
     if not isinstance(checkpoint, dict):
-        raise ValueError(
-            "create_kg expects a dict checkpoint. Got raw state dict."
-        )
+        raise ValueError("create_kg expects a dict checkpoint. Got raw state dict.")
     if checkpoint.get("stage") != 2 or checkpoint.get("stage2_mode") != "clean":
         print(
             "  Note: Checkpoint may not be Stage 2 clean. Attempting to load anyway..."
@@ -561,7 +559,9 @@ class KnowledgeGraph:
         self.X_windows_unnormalized = X_windows_unnormalized
 
         # Compute distribution thresholds upfront so the single window pass uses them directly
-        self.distribution_thresholds = self._compute_distribution_thresholds(gdn_predictions)
+        self.distribution_thresholds = self._compute_distribution_thresholds(
+            gdn_predictions
+        )
 
         print(f"Processing {num_windows} windows...")
         for window_idx in tqdm(range(num_windows), desc="Building KG"):
@@ -623,7 +623,9 @@ class KnowledgeGraph:
         window_graph = nx.Graph()
 
         thresholds = self.distribution_thresholds
-        anomaly_threshold_per_sensor = thresholds.get("anomaly_threshold_per_sensor", {})
+        anomaly_threshold_per_sensor = thresholds.get(
+            "anomaly_threshold_per_sensor", {}
+        )
         anomaly_threshold_global = thresholds.get("anomaly_threshold_global", 0.5)
         deviation_threshold = thresholds.get("deviation_threshold", 0.3)
 
@@ -864,13 +866,17 @@ class KnowledgeGraph:
             gdn_predictions: (num_windows, num_sensors) GDN anomaly scores
         """
         flat = gdn_predictions.flatten()
-        anomaly_threshold_global = float(np.percentile(flat, 95)) if len(flat) > 0 else 0.5
+        anomaly_threshold_global = (
+            float(np.percentile(flat, 95)) if len(flat) > 0 else 0.5
+        )
 
         anomaly_threshold_per_sensor = {}
         for sensor_idx, sensor_name in enumerate(self.sensor_names):
             scores = gdn_predictions[:, sensor_idx]
             anomaly_threshold_per_sensor[sensor_name] = (
-                float(np.percentile(scores, 95)) if len(scores) > 0 else anomaly_threshold_global
+                float(np.percentile(scores, 95))
+                if len(scores) > 0
+                else anomaly_threshold_global
             )
 
         return {
@@ -972,9 +978,7 @@ class KnowledgeGraph:
             }
 
             context["relationships"].append(relationship)
-            if is_violation and (
-                u in anomalous_sensors or v in anomalous_sensors
-            ):
+            if is_violation and (u in anomalous_sensors or v in anomalous_sensors):
                 context["violations"].append(relationship)
 
         for prev_idx in range(
@@ -1086,7 +1090,9 @@ class KnowledgeGraph:
             data = {
                 "sensor_names": self.sensor_names,
                 "sensor_embeddings": self.sensor_embeddings.tolist(),
-                "adjacency_matrix": self.adjacency_matrix.tolist() if self.adjacency_matrix is not None else None,
+                "adjacency_matrix": self.adjacency_matrix.tolist()
+                if self.adjacency_matrix is not None
+                else None,
                 "window_graphs": {
                     str(k): nx.node_link_data(v) for k, v in self.window_graphs.items()
                 },
